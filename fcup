@@ -1,0 +1,241 @@
+import datetime
+import sqlite3
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+
+API_TOKEN = "ТОКЕН_ОТ_BOTFATHER"
+ADMIN_ID = 123456789  # сюда вставь свой Telegram ID
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+
+# === База данных ===
+conn = sqlite3.connect("tournament.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS teams (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    commander_id INTEGER UNIQUE,
+    commander_phone TEXT,
+    team_name TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS slots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id INTEGER,
+    slot TEXT,
+    FOREIGN KEY(team_id) REFERENCES teams(id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team1_id INTEGER,
+    team2_id INTEGER,
+    slot TEXT,
+    FOREIGN KEY(team1_id) REFERENCES teams(id),
+    FOREIGN KEY(team2_id) REFERENCES teams(id)
+)
+""")
+conn.commit()
+
+# === Генерация клавиатур ===
+def main_menu(is_admin=False):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("📅 Выбрать слоты", "📖 Мои матчи")
+    if is_admin:
+        kb.add("📋 Все матчи (админ)")
+    return kb
+
+def generate_slots_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    now = datetime.datetime.now()
+    today = now.date()
+
+    for i in range(0, 7 - today.weekday()):  # до воскресенья
+        day = today + datetime.timedelta(days=i)
+        day_str = day.strftime("%A %d.%m")  # например, Friday 27.09
+        for hour in range(19, 23):
+            for minute in [0, 30]:
+                if hour == 22 and minute > 0:
+                    continue
+                time_str = f"{hour:02d}:{minute:02d}"
+                kb.add(f"{day_str} {time_str}")
+    kb.add("✅ Завершить выбор")
+    return kb
+
+def admin_matches_keyboard(matches):
+    kb = InlineKeyboardMarkup()
+    for match_id, slot, team1, team2 in matches:
+        kb.add(InlineKeyboardButton(
+            f"❌ {slot} | {team1} vs {team2}", callback_data=f"delmatch_{match_id}"
+        ))
+    return kb
+
+# === Регистрация ===
+phone_btn = KeyboardButton("📱 Отправить номер", request_contact=True)
+phone_kb = ReplyKeyboardMarkup(resize_keyboard=True).add(phone_btn)
+
+@dp.message_handler(commands=["start"])
+async def start_cmd(message: types.Message):
+    is_admin = (message.from_user.id == ADMIN_ID)
+    await message.answer("Привет! Для начала регистрации отправь свой номер телефона:", reply_markup=phone_kb)
+
+@dp.message_handler(content_types=types.ContentType.CONTACT)
+async def get_contact(message: types.Message):
+    phone = message.contact.phone_number
+    user_id = message.from_user.id
+    cursor.execute("INSERT OR IGNORE INTO teams (commander_id, commander_phone) VALUES (?, ?)", (user_id, phone))
+    conn.commit()
+    await message.answer("✅ Номер сохранён! Теперь отправь название своей команды:", reply_markup=ReplyKeyboardRemove())
+
+@dp.message_handler(lambda msg: msg.text and not msg.text.startswith("/") and not msg.text.startswith("✅"))
+async def set_team_name(message: types.Message):
+    user_id = message.from_user.id
+    team_name = message.text.strip()
+    cursor.execute("UPDATE teams SET team_name = ? WHERE commander_id = ?", (team_name, user_id))
+    conn.commit()
+
+    is_admin = (message.from_user.id == ADMIN_ID)
+    await message.answer(f"Команда *{team_name}* зарегистрирована! 🎉", parse_mode="Markdown", reply_markup=main_menu(is_admin))
+
+# === Выбор времени ===
+@dp.message_handler(lambda msg: msg.text == "📅 Выбрать слоты")
+async def choose_time(message: types.Message):
+    kb = generate_slots_keyboard()
+    await message.answer("Выбирай удобные слоты (можно несколько). Когда закончишь — нажми '✅ Завершить выбор'.", reply_markup=kb)
+
+@dp.message_handler(lambda msg: msg.text and "✅ Завершить выбор" in msg.text)
+async def finish_slots(message: types.Message):
+    is_admin = (message.from_user.id == ADMIN_ID)
+    await message.answer("✅ Выбор слотов завершён! Теперь ждём соперника.", reply_markup=main_menu(is_admin))
+
+    # Проверка совпадений
+    user_id = message.from_user.id
+    cursor.execute("SELECT id, team_name FROM teams WHERE commander_id = ?", (user_id,))
+    team = cursor.fetchone()
+    if not team:
+        return
+    team_id, team_name = team
+
+    cursor.execute("SELECT slot FROM slots WHERE team_id = ?", (team_id,))
+    my_slots = [row[0] for row in cursor.fetchall()]
+
+    # Сравниваем с другими командами
+    cursor.execute("""
+        SELECT t.id, t.team_name, t.commander_id, s.slot 
+        FROM teams t 
+        JOIN slots s ON t.id = s.team_id 
+        WHERE t.id != ?
+    """, (team_id,))
+    other_data = cursor.fetchall()
+
+    for other_id, other_name, other_commander, slot in other_data:
+        if slot in my_slots:
+            cursor.execute("SELECT id FROM matches WHERE (team1_id=? AND team2_id=? OR team1_id=? AND team2_id=?) AND slot=?", (team_id, other_id, other_id, team_id, slot))
+            if cursor.fetchone():
+                continue
+
+            cursor.execute("INSERT INTO matches (team1_id, team2_id, slot) VALUES (?, ?, ?)", (team_id, other_id, slot))
+            conn.commit()
+
+            await bot.send_message(message.from_user.id, f"📢 Найден соперник! Вы играете против *{other_name}* в {slot}", parse_mode="Markdown")
+            await bot.send_message(other_commander, f"📢 Найден соперник! Вы играете против *{team_name}* в {slot}", parse_mode="Markdown")
+            break
+
+@dp.message_handler(lambda msg: msg.text and ":" in msg.text and "." in msg.text)
+async def save_slot(message: types.Message):
+    user_id = message.from_user.id
+    slot = message.text.strip()
+
+    cursor.execute("SELECT id FROM teams WHERE commander_id = ?", (user_id,))
+    team = cursor.fetchone()
+    if not team:
+        await message.answer("Сначала зарегистрируйся с помощью /start")
+        return
+
+    team_id = team[0]
+    cursor.execute("INSERT INTO slots (team_id, slot) VALUES (?, ?)", (team_id, slot))
+    conn.commit()
+
+    await message.answer(f"✅ Слот {slot} добавлен! Можешь выбрать ещё или нажать '✅ Завершить выбор'.")
+
+# === Просмотр своих матчей ===
+@dp.message_handler(lambda msg: msg.text == "📖 Мои матчи")
+async def my_matches(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT id FROM teams WHERE commander_id = ?", (user_id,))
+    team = cursor.fetchone()
+    if not team:
+        await message.answer("Ты ещё не зарегистрирован.")
+        return
+
+    team_id = team[0]
+    cursor.execute("""
+        SELECT m.slot, t1.team_name, t2.team_name 
+        FROM matches m 
+        JOIN teams t1 ON m.team1_id = t1.id
+        JOIN teams t2 ON m.team2_id = t2.id
+        WHERE m.team1_id = ? OR m.team2_id = ?
+        ORDER BY m.slot
+    """, (team_id, team_id))
+    matches = cursor.fetchall()
+
+    if not matches:
+        await message.answer("У твоей команды пока нет назначенных матчей.")
+        return
+
+    text = "📖 Твои матчи:\n\n"
+    for slot, team1, team2 in matches:
+        text += f"🕒 {slot}\n⚔ {team1} vs {team2}\n\n"
+
+    await message.answer(text)
+
+# === Админ — просмотр матчей ===
+@dp.message_handler(lambda msg: msg.text == "📋 Все матчи (админ)")
+async def show_matches(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У тебя нет доступа.")
+        return
+
+    cursor.execute("""
+        SELECT m.id, m.slot, t1.team_name, t2.team_name
+        FROM matches m
+        JOIN teams t1 ON m.team1_id = t1.id
+        JOIN teams t2 ON m.team2_id = t2.id
+        ORDER BY m.slot
+    """)
+    matches = cursor.fetchall()
+
+    if not matches:
+        await message.answer("Пока матчей нет.")
+        return
+
+    text = "📋 Список назначенных матчей:\n\n"
+    for match_id, slot, team1, team2 in matches:
+        text += f"ID:{match_id} 🕒 {slot}\n⚔ {team1} vs {team2}\n\n"
+
+    await message.answer(text, reply_markup=admin_matches_keyboard(matches))
+
+# === Удаление матча ===
+@dp.callback_query_handler(lambda c: c.data.startswith("delmatch_"))
+async def delete_match(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    match_id = int(callback.data.split("_")[1])
+    cursor.execute("DELETE FROM matches WHERE id = ?", (match_id,))
+    conn.commit()
+
+    await callback.answer("Матч удалён ✅")
+    await callback.message.edit_text("Матч удалён ✅")
+
+# === Запуск ===
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
