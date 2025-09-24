@@ -97,7 +97,8 @@ contact_kb = ReplyKeyboardMarkup(
 commander_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📅 Назначить игру")],
-        [KeyboardButton(text="📖 Мое расписание")]
+        [KeyboardButton(text="📖 Мое расписание")],
+        [KeyboardButton(text="📊 Результаты за дату")] 
     ],
     resize_keyboard=True
 )
