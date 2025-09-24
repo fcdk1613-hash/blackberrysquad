@@ -12,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 API_TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
+GROUP_CHAT_ID = -1001234567890  # 🔥 Укажи сюда ID вашего общего чата
 
 # Подключение базы
 conn = sqlite3.connect("tournament.db")
@@ -165,9 +166,35 @@ async def process_time(message: types.Message, state: FSMContext):
     date = data.get("date")
     user_id = message.from_user.id
 
+    # Сохраняем матч
     cursor.execute("INSERT INTO matches (team_id, date, time, result) VALUES (?, ?, ?, ?)",
                    (user_id, date, time, None))
     conn.commit()
+
+    # Проверка на совпадение слота
+    cursor.execute("SELECT team_id FROM matches WHERE date=? AND time=? AND result IS NULL", (date, time))
+    teams = [row[0] for row in cursor.fetchall()]
+
+    if len(teams) == 2:  # Нашлись два соперника
+        cursor.execute("SELECT team_name FROM commanders WHERE user_id=?", (teams[0],))
+        team1 = cursor.fetchone()[0] or f"ID {teams[0]}"
+        cursor.execute("SELECT team_name FROM commanders WHERE user_id=?", (teams[1],))
+        team2 = cursor.fetchone()[0] or f"ID {teams[1]}"
+
+        text = f"⚔️ Назначен матч!\n📅 {date} ⏰ {time}\n🏆 {team1} vs {team2}"
+
+        # ЛС командирам
+        for t in teams:
+            try:
+                await bot.send_message(t, text)
+            except:
+                pass
+
+        # Сообщение в общий чат
+        try:
+            await bot.send_message(GROUP_CHAT_ID, text)
+        except:
+            pass
 
     await message.answer(f"✅ Вы выбрали слот: {date} {time}. Ждём соперника!", reply_markup=commander_menu)
     await state.clear()
@@ -186,7 +213,7 @@ async def my_schedule(message: types.Message):
         text += f"{row[0]} {row[1]} - {row[2] or 'Ожидание результата'}\n"
     await message.answer(text)
 
-# Результаты за дату (для судей и командиров)
+# Результаты за дату
 @dp.message(F.text == "📊 Результаты за дату")
 async def results_by_date(message: types.Message):
     cursor.execute("SELECT DISTINCT date FROM matches WHERE result IS NOT NULL ORDER BY date")
