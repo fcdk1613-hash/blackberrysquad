@@ -1,13 +1,8 @@
-#!/usr/bin/env python3
-# fcup - squad tournament bot (aiogram 3.x) — рабочий + правки
-
 import asyncio
-import logging
 import sqlite3
-from datetime import date, timedelta
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
@@ -16,80 +11,48 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
-# ---------------- CONFIG ----------------
 API_TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --------------- DB ---------------------
-conn = sqlite3.connect("tournament.db", check_same_thread=False)
+# Подключение базы
+conn = sqlite3.connect("tournament.db")
 cursor = conn.cursor()
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS commanders (
     user_id INTEGER PRIMARY KEY,
     phone TEXT,
-    role TEXT,
     team_name TEXT
 )
 """)
-
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS match_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER,
-    date TEXT,
-    time TEXT
+CREATE TABLE IF NOT EXISTS judges (
+    user_id INTEGER PRIMARY KEY,
+    phone TEXT
 )
 """)
-
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS matches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team1_id INTEGER,
-    team2_id INTEGER,
+    team_id INTEGER,
     date TEXT,
     time TEXT,
-    result TEXT,
-    judge_id INTEGER
+    result TEXT
 )
 """)
-
 conn.commit()
 
-# ------------- FSM states ---------------
-class RegStates(StatesGroup):
-    choosing_role = State()
-    waiting_for_phone = State()
+# FSM
+class RegisterCommander(StatesGroup):
     waiting_for_team_name = State()
 
-class ScheduleStates(StatesGroup):
-    choosing_date = State()
-    choosing_time = State()
+class RegisterJudge(StatesGroup):
+    pass
 
-class JudgeStates(StatesGroup):
-    entering_result = State()
+class GameSchedule(StatesGroup):
+    waiting_for_date = State()
+    waiting_for_time = State()
 
-# ------------- Bot init -----------------
-bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher(storage=MemoryStorage())
-
-# ------------- Keyboards ----------------
-role_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🛡 Я - командир"), KeyboardButton(text="⚖️ Я - судья")]
-    ],
-    resize_keyboard=True
-)
-
-contact_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
-    resize_keyboard=True,
-    one_time_keyboard=True
-)
-
-# Добавляем пункт 📊 Результаты за дату в меню командира
+# Меню командиров
 commander_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📅 Назначить игру")],
@@ -99,121 +62,159 @@ commander_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Меню судей
 judge_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📝 Добавить результат")],
         [KeyboardButton(text="📊 Результаты за дату")]
     ],
     resize_keyboard=True
 )
 
-# ------------- Helpers ------------------
-def dates_next_week():
-    today = date.today()
-    return [(today + timedelta(days=i)).isoformat() for i in range(7)]
+# Инициализация бота
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-def send_safe(user_id: int, text: str):
-    async def _send():
-        try:
-            await bot.send_message(user_id, text)
-        except Exception as e:
-            logger.info("Не удалось отправить сообщение %s: %s", user_id, e)
-    asyncio.create_task(_send())
+# /start
+@dp.message(F.text == "/start")
+async def start(message: types.Message):
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Я - командир")],
+            [KeyboardButton(text="Я - судья")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите роль:", reply_markup=kb)
 
-# ------------- Handlers -----------------
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    cursor.execute("SELECT role, team_name FROM users WHERE user_id = ?", (message.from_user.id,))
-    r = cursor.fetchone()
-    if r:
-        role = r[0]
-        if role == "commander":
-            await message.answer("Вы зарегистрированы как командир.", reply_markup=commander_menu)
-        else:
-            await message.answer("Вы зарегистрированы как судья.", reply_markup=judge_menu)
-        return
+# Регистрация командира
+@dp.message(F.text == "Я - командир")
+async def register_commander(message: types.Message, state: FSMContext):
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True
+    )
+    await message.answer("Отправьте свой номер телефона:", reply_markup=kb)
+    await state.set_state(RegisterCommander.waiting_for_team_name)
 
-    await message.answer("Привет! Выбери роль:", reply_markup=role_kb)
-    await state.set_state(RegStates.choosing_role)
-
-# --- Выбор роли ---
-@dp.message(RegStates.choosing_role, F.text.in_(["🛡 Я - командир", "⚖️ Я - судья"]))
-async def choose_role(message: types.Message, state: FSMContext):
-    role = "commander" if message.text == "🛡 Я - командир" else "judge"
-    await state.update_data(chosen_role=role)
-    await message.answer("Пожалуйста, поделитесь номером телефона:", reply_markup=contact_kb)
-    await state.set_state(RegStates.waiting_for_phone)
-
-# --- Получение контакта ---
-@dp.message(RegStates.waiting_for_phone, F.content_type == types.ContentType.CONTACT)
-async def got_contact(message: types.Message, state: FSMContext):
+@dp.message(F.contact, RegisterCommander.waiting_for_team_name)
+async def process_commander_contact(message: types.Message, state: FSMContext):
     phone = message.contact.phone_number
-    data = await state.get_data()
-    role = data.get("chosen_role")
     user_id = message.from_user.id
-
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, phone, role) VALUES (?, ?, ?)", (user_id, phone, role))
+    cursor.execute("INSERT OR REPLACE INTO commanders (user_id, phone, team_name) VALUES (?, ?, ?)",
+                   (user_id, phone, None))
     conn.commit()
+    await message.answer("Введите название вашей команды:")
+    await state.update_data(phone=phone)
 
-    if role == "commander":
-        await message.answer("Отлично. Введи название вашей команды (одно сообщение):", reply_markup=types.ReplyKeyboardRemove())
-        await state.set_state(RegStates.waiting_for_team_name)
-    else:
-        await message.answer("Вы зарегистрированы как судья ✅", reply_markup=judge_menu)
-        await state.clear()
-
-# --- Получение названия команды ---
-@dp.message(RegStates.waiting_for_team_name, F.text)
-async def got_team_name(message: types.Message, state: FSMContext):
-    team_name = message.text.strip()
-    if not team_name:
-        await message.answer("Название команды не может быть пустым. Введите ещё раз.")
-        return
-
+@dp.message(RegisterCommander.waiting_for_team_name)
+async def process_team_name(message: types.Message, state: FSMContext):
+    team_name = message.text
     user_id = message.from_user.id
-    cursor.execute("UPDATE users SET team_name = ? WHERE user_id = ?", (team_name, user_id))
+    cursor.execute("UPDATE commanders SET team_name=? WHERE user_id=?", (team_name, user_id))
     conn.commit()
-
-    await message.answer(f"Команда <b>{team_name}</b> зарегистрирована ✅", reply_markup=commander_menu)
+    await message.answer(f"✅ Команда {team_name} зарегистрирована!", reply_markup=commander_menu)
     await state.clear()
 
-# --- Назначить игру (командир) ---
+# Регистрация судьи
+@dp.message(F.text == "Я - судья")
+async def register_judge(message: types.Message):
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True
+    )
+    await message.answer("Отправьте свой номер телефона:", reply_markup=kb)
+
+@dp.message(F.contact)
+async def process_judge_contact(message: types.Message):
+    phone = message.contact.phone_number
+    user_id = message.from_user.id
+    cursor.execute("INSERT OR REPLACE INTO judges (user_id, phone) VALUES (?, ?)", (user_id, phone))
+    conn.commit()
+    await message.answer("✅ Вы зарегистрированы как судья!", reply_markup=judge_menu)
+
+# Назначить игру
 @dp.message(F.text == "📅 Назначить игру")
-async def start_schedule(message: types.Message, state: FSMContext):
-    cursor.execute("SELECT role, team_name FROM users WHERE user_id = ?", (message.from_user.id,))
-    row = cursor.fetchone()
-    if not row or row[0] != "commander" or not row[1]:
-        await message.answer("Сначала зарегистрируйтесь как командир и укажите название команды.")
+async def choose_date(message: types.Message, state: FSMContext):
+    today = datetime.today()
+    dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=d)] for d in dates],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите дату:", reply_markup=kb)
+    await state.set_state(GameSchedule.waiting_for_date)
+
+@dp.message(GameSchedule.waiting_for_date)
+async def on_date_chosen(message: types.Message, state: FSMContext):
+    await state.update_data(date=message.text)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="19:00")],
+            [KeyboardButton(text="20:00")],
+            [KeyboardButton(text="21:00")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите время:", reply_markup=kb)
+    await state.set_state(GameSchedule.waiting_for_time)
+
+@dp.message(GameSchedule.waiting_for_time, F.text.in_(["19:00", "20:00", "21:00"]))
+async def process_time(message: types.Message, state: FSMContext):
+    time = message.text
+    data = await state.get_data()
+    date = data.get("date")
+    user_id = message.from_user.id
+
+    cursor.execute("INSERT INTO matches (team_id, date, time, result) VALUES (?, ?, ?, ?)",
+                   (user_id, date, time, None))
+    conn.commit()
+
+    await message.answer(f"✅ Вы выбрали слот: {date} {time}. Ждём соперника!", reply_markup=commander_menu)
+    await state.clear()
+
+# Мое расписание
+@dp.message(F.text == "📖 Мое расписание")
+async def my_schedule(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT date, time, result FROM matches WHERE team_id=?", (user_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await message.answer("У вас пока нет назначенных матчей.")
         return
+    text = "📖 Ваше расписание:\n"
+    for row in rows:
+        text += f"{row[0]} {row[1]} - {row[2] or 'Ожидание результата'}\n"
+    await message.answer(text)
 
-    dates = dates_next_week()
-    inline_buttons = []
-    for d in dates:
-        inline_buttons.append([InlineKeyboardButton(text=d, callback_data=f"slot_date:{d}")])
+# Результаты за дату (для судей и командиров)
+@dp.message(F.text == "📊 Результаты за дату")
+async def results_by_date(message: types.Message):
+    cursor.execute("SELECT DISTINCT date FROM matches WHERE result IS NOT NULL ORDER BY date")
+    dates = [r[0] for r in cursor.fetchall()]
+    if not dates:
+        await message.answer("Пока нет результатов.")
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=d, callback_data=f"resdate:{d}")] for d in dates]
+    )
+    await message.answer("Выберите дату:", reply_markup=kb)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=inline_buttons)
-    await message.answer("Выберите дату (ближайшие 7 дней):", reply_markup=kb)
-    await state.set_state(ScheduleStates.choosing_date)
+@dp.callback_query(F.data.startswith("resdate:"))
+async def show_results(callback: types.CallbackQuery):
+    date = callback.data.split(":")[1]
+    cursor.execute("SELECT team_id, time, result FROM matches WHERE date=? AND result IS NOT NULL", (date,))
+    rows = cursor.fetchall()
+    if not rows:
+        await callback.message.answer("В этот день матчей с результатами не найдено.")
+        return
+    text = f"📊 Результаты за {date}:\n"
+    for row in rows:
+        text += f"Команда {row[0]} — {row[1]} — {row[2]}\n"
+    await callback.message.answer(text)
 
-@dp.callback_query(F.data.startswith("slot_date:"))
-async def on_date_chosen(cb: types.CallbackQuery, state: FSMContext):
-    _, date_iso = cb.data.split(":", 1)
-
-    # Добавляем новый слот 19:00
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="19:00", callback_data=f"slot_time:{date_iso}|19:00")],
-        [InlineKeyboardButton(text="20:00", callback_data=f"slot_time:{date_iso}|20:00")],
-        [InlineKeyboardButton(text="21:00", callback_data=f"slot_time:{date_iso}|21:00")]
-    ])
-    await cb.message.answer(f"Выбрана дата {date_iso}. Выберите время:", reply_markup=kb)
-    await cb.answer()
-    await state.update_data(chosen_date=date_iso)
-
-# --- Остальной код (расписание, результаты, судьи и т.п.) остаётся без изменений ---
-# Он уже рабочий и не тронут
-# ----------------------------------------
-
+# Запуск
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
