@@ -1,6 +1,6 @@
 import asyncio
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
@@ -12,7 +12,7 @@ from aiogram.types import (
 )
 
 # === Настройки ===
-TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
+TOKEN = "ТОКЕН_ТВОЕГО_БОТА"
 
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS matches (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS roles (
+    user_id INTEGER PRIMARY KEY,
+    role TEXT
+)
+""")
+
 conn.commit()
 
 # === Клавиатуры ===
@@ -77,49 +84,58 @@ async def cmd_start(message: types.Message):
 # --- Регистрация командира ---
 @dp.message(F.text == "Я - командир")
 async def register_commander(message: types.Message):
+    cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (message.from_user.id, "commander"))
+    conn.commit()
     await message.answer("Пожалуйста, отправьте свой номер телефона:", reply_markup=contact_kb)
 
 
+# --- Регистрация судьи ---
+@dp.message(F.text == "Я - судья")
+async def register_judge(message: types.Message):
+    cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (message.from_user.id, "judge"))
+    conn.commit()
+    await message.answer("Пожалуйста, отправьте свой номер телефона:", reply_markup=contact_kb)
+
+
+# --- Обработка телефона ---
 @dp.message(F.contact)
 async def process_contact(message: types.Message):
     phone = message.contact.phone_number
     user_id = message.from_user.id
 
-    # Проверяем — командир или судья?
-    existing_commander = cursor.execute("SELECT id FROM commanders WHERE user_id = ?", (user_id,)).fetchone()
-    existing_judge = cursor.execute("SELECT id FROM judges WHERE user_id = ?", (user_id,)).fetchone()
-
-    if existing_commander or existing_judge:
-        await message.answer("Вы уже зарегистрированы!", reply_markup=ReplyKeyboardRemove())
+    # Определяем роль
+    role_row = cursor.execute("SELECT role FROM roles WHERE user_id = ?", (user_id,)).fetchone()
+    if not role_row:
+        await message.answer("Сначала выберите роль: командир или судья", reply_markup=main_kb)
         return
 
-    if "командир" in (message.text or "").lower():  # fallback
+    role = role_row[0]
+
+    if role == "commander":
         cursor.execute("INSERT OR REPLACE INTO commanders (user_id, phone, team_name) VALUES (?, ?, ?)",
                        (user_id, phone, None))
         conn.commit()
         await message.answer("Теперь отправьте название вашей команды:", reply_markup=ReplyKeyboardRemove())
-    else:
+
+    elif role == "judge":
         cursor.execute("INSERT OR REPLACE INTO judges (user_id, phone, name) VALUES (?, ?, ?)",
                        (user_id, phone, message.from_user.full_name))
         conn.commit()
         await message.answer("Вы зарегистрированы как судья!", reply_markup=ReplyKeyboardRemove())
 
 
+# --- Сохранение названия команды ---
 @dp.message(F.text & ~F.via_bot & ~F.contact)
 async def save_team_name(message: types.Message):
     user_id = message.from_user.id
-    commander = cursor.execute("SELECT * FROM commanders WHERE user_id = ? AND team_name IS NULL", (user_id,)).fetchone()
+    commander = cursor.execute(
+        "SELECT * FROM commanders WHERE user_id = ? AND team_name IS NULL", (user_id,)
+    ).fetchone()
 
     if commander:
         cursor.execute("UPDATE commanders SET team_name = ? WHERE user_id = ?", (message.text, user_id))
         conn.commit()
         await message.answer(f"Команда <b>{message.text}</b> зарегистрирована!", reply_markup=ReplyKeyboardRemove())
-
-
-# --- Регистрация судьи ---
-@dp.message(F.text == "Я - судья")
-async def register_judge(message: types.Message):
-    await message.answer("Пожалуйста, отправьте свой номер телефона:", reply_markup=contact_kb)
 
 
 # --- Судья добавляет результаты ---
@@ -130,7 +146,7 @@ async def judge_add_result(message: types.Message):
         await message.answer("Нет матчей без результатов.")
         return
 
-    reply = "Выберите матч:\n"
+    reply = "Выберите матч и укажите результат (формат: <id>. Победила команда ...):\n"
     for m in matches:
         reply += f"{m[0]}. {m[1]} vs {m[2]} — {m[3]}\n"
     await message.answer(reply)
@@ -147,7 +163,7 @@ async def save_result(message: types.Message):
         conn.commit()
 
         await message.answer(f"Результат для матча {match_id} сохранён: {result}")
-    except Exception as e:
+    except Exception:
         await message.answer("Ошибка при сохранении результата. Используйте формат:\n1. Победила команда A")
 
 
@@ -155,7 +171,9 @@ async def save_result(message: types.Message):
 @dp.message(F.text == "Результаты за сегодня")
 async def today_results(message: types.Message):
     today = datetime.now().strftime("%Y-%m-%d")
-    matches = cursor.execute("SELECT team1, team2, match_time, result FROM matches WHERE date(match_time) = ?", (today,)).fetchall()
+    matches = cursor.execute(
+        "SELECT team1, team2, match_time, result FROM matches WHERE date(match_time) = ?", (today,)
+    ).fetchall()
 
     if not matches:
         await message.answer("Сегодня матчей не было.")
