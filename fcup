@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS match_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     team_id INTEGER,
     date TEXT,   -- YYYY-MM-DD
-    time TEXT    -- HH:MM (20:00/21:00)
+    time TEXT    -- HH:MM (19:00/20:00/21:00)
 )
 """)
 
@@ -213,10 +213,10 @@ async def start_schedule(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("slot_date:"))
 async def on_date_chosen(cb: types.CallbackQuery, state: FSMContext):
     _, date_iso = cb.data.split(":", 1)
-    # Предлагаем два времени: 20:00 и 21:00
+    # Предлагаем три времени
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="20:00", callback_data=f"slot_time:{date_iso}|19:00")],
-        [InlineKeyboardButton(text="21:00", callback_data=f"slot_time:{date_iso}|20:00")],
+        [InlineKeyboardButton(text="19:00", callback_data=f"slot_time:{date_iso}|19:00")],
+        [InlineKeyboardButton(text="20:00", callback_data=f"slot_time:{date_iso}|20:00")],
         [InlineKeyboardButton(text="21:00", callback_data=f"slot_time:{date_iso}|21:00")]
     ])
     await cb.message.answer(f"Выбрана дата {date_iso}. Выберите время:", reply_markup=kb)
