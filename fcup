@@ -1,81 +1,70 @@
-import asyncio
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
+from aiogram.filters import CommandStart
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# === Настройки ===
+# === ВСТАВЬ СВОЙ ТОКЕН СЮДА ===
 TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
 
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+bot = Bot(token=TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
 
-# === База данных ===
+# --- БД ---
 conn = sqlite3.connect("squadbot.db")
 cursor = conn.cursor()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS commanders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER UNIQUE,
+# Таблицы
+cursor.execute("""CREATE TABLE IF NOT EXISTS commanders (
+    user_id INTEGER PRIMARY KEY,
     phone TEXT,
     team_name TEXT
-)
-""")
+)""")
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS judges (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER UNIQUE,
+cursor.execute("""CREATE TABLE IF NOT EXISTS judges (
+    user_id INTEGER PRIMARY KEY,
     phone TEXT,
     name TEXT
-)
-""")
+)""")
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS matches (
+cursor.execute("""CREATE TABLE IF NOT EXISTS matches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     team1 TEXT,
     team2 TEXT,
     match_time TEXT,
     result TEXT,
     judge_id INTEGER
-)
-""")
+)""")
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS roles (
+cursor.execute("""CREATE TABLE IF NOT EXISTS roles (
     user_id INTEGER PRIMARY KEY,
     role TEXT
-)
-""")
+)""")
+
+cursor.execute("""CREATE TABLE IF NOT EXISTS temp_schedule (
+    user_id INTEGER,
+    datetime TEXT
+)""")
 
 conn.commit()
 
-# === Клавиатуры ===
+# --- Клавиатуры ---
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Я - командир")],
-        [KeyboardButton(text="Я - судья")]
+        [KeyboardButton(text="Я - командир"), KeyboardButton(text="Я - судья")]
     ],
     resize_keyboard=True
 )
 
 contact_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Отправить телефон", request_contact=True)]
-    ],
+    keyboard=[[KeyboardButton(text="Отправить телефон", request_contact=True)]],
     resize_keyboard=True
 )
 
-# Меню после регистрации
 commander_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Запланировать матч")],
@@ -92,38 +81,47 @@ judge_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === Хэндлеры ===
+# --- Вспомогательные функции ---
+def generate_time_slots():
+    now = datetime.now()
+    slots = []
+    for i in range(7 - now.weekday()):  # остаток недели
+        day = now + timedelta(days=i)
+        for hour in range(19, 22):
+            for minute in [0, 30]:
+                slots.append((day.replace(hour=hour, minute=minute, second=0, microsecond=0)).strftime("%d.%m %H:%M"))
+        slots.append((day.replace(hour=22, minute=0, second=0, microsecond=0)).strftime("%d.%m %H:%M"))
+    return slots
+
+def chunk_list(lst, size=3):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+# --- Хэндлеры ---
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    await message.answer("Добро пожаловать в турнирный бот Squad!\nВыберите роль:", reply_markup=main_kb)
+async def start(message: types.Message):
+    await message.answer("Добро пожаловать в турнир Squad! Выберите роль:", reply_markup=main_kb)
 
-
-# --- Регистрация командира ---
 @dp.message(F.text == "Я - командир")
 async def register_commander(message: types.Message):
     cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (message.from_user.id, "commander"))
     conn.commit()
     await message.answer("Пожалуйста, отправьте свой номер телефона:", reply_markup=contact_kb)
 
-
-# --- Регистрация судьи ---
 @dp.message(F.text == "Я - судья")
 async def register_judge(message: types.Message):
     cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (message.from_user.id, "judge"))
     conn.commit()
     await message.answer("Пожалуйста, отправьте свой номер телефона:", reply_markup=contact_kb)
 
-
-# --- Обработка телефона ---
 @dp.message(F.contact)
 async def process_contact(message: types.Message):
     phone = message.contact.phone_number
     user_id = message.from_user.id
-
-    # Определяем роль
     role_row = cursor.execute("SELECT role FROM roles WHERE user_id = ?", (user_id,)).fetchone()
+
     if not role_row:
-        await message.answer("Сначала выберите роль: командир или судья", reply_markup=main_kb)
+        await message.answer("Сначала выберите роль.", reply_markup=main_kb)
         return
 
     role = role_row[0]
@@ -138,83 +136,146 @@ async def process_contact(message: types.Message):
         cursor.execute("INSERT OR REPLACE INTO judges (user_id, phone, name) VALUES (?, ?, ?)",
                        (user_id, phone, message.from_user.full_name))
         conn.commit()
-        await message.answer(
-            "Вы зарегистрированы как судья!\nВыберите действие:",
-            reply_markup=judge_menu
-        )
+        await message.answer("Вы зарегистрированы как судья!", reply_markup=judge_menu)
 
-
-# --- Сохранение названия команды ---
 @dp.message(F.text & ~F.via_bot & ~F.contact)
 async def save_team_name(message: types.Message):
     user_id = message.from_user.id
-    commander = cursor.execute(
-        "SELECT * FROM commanders WHERE user_id = ? AND team_name IS NULL", (user_id,)
-    ).fetchone()
+    commander = cursor.execute("SELECT * FROM commanders WHERE user_id = ? AND team_name IS NULL", (user_id,)).fetchone()
 
     if commander:
         cursor.execute("UPDATE commanders SET team_name = ? WHERE user_id = ?", (message.text, user_id))
         conn.commit()
-        await message.answer(
-            f"Команда <b>{message.text}</b> зарегистрирована!\nВыберите действие:",
-            reply_markup=commander_menu
-        )
+        await message.answer(f"Команда <b>{message.text}</b> зарегистрирована!\nВыберите действие:", reply_markup=commander_menu)
 
+# --- Планирование матча ---
+@dp.message(F.text == "Запланировать матч")
+async def commander_schedule_match(message: types.Message):
+    slots = generate_time_slots()
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=slot) for slot in row] for row in chunk_list(slots, 3)],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите удобное время:", reply_markup=kb)
 
-# --- Судья добавляет результаты ---
+@dp.message(F.text.regexp(r"\d{2}\.\d{2} \d{2}:\d{2}"))
+async def process_time_choice(message: types.Message):
+    user_id = message.from_user.id
+    team_row = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (user_id,)).fetchone()
+    if not team_row:
+        await message.answer("Вы не зарегистрированы как командир.")
+        return
+
+    team_name = team_row[0]
+    slot = datetime.strptime(message.text, "%d.%m %H:%M")
+
+    cursor.execute("INSERT INTO temp_schedule (user_id, datetime) VALUES (?, ?)", (user_id, slot.isoformat()))
+    conn.commit()
+
+    opponent_row = cursor.execute(
+        "SELECT user_id FROM temp_schedule WHERE datetime = ? AND user_id != ?",
+        (slot.isoformat(), user_id)
+    ).fetchone()
+
+    if opponent_row:
+        opponent_id = opponent_row[0]
+        opponent_team = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (opponent_id,)).fetchone()
+
+        if opponent_team:
+            cursor.execute(
+                "INSERT INTO matches (team1, team2, match_time, result, judge_id) VALUES (?, ?, ?, ?, ?)",
+                (team_name, opponent_team[0], slot.isoformat(), None, None)
+            )
+            conn.commit()
+
+            cursor.execute("DELETE FROM temp_schedule WHERE datetime = ?", (slot.isoformat(),))
+            conn.commit()
+
+            await bot.send_message(user_id, f"✅ Матч назначен: {team_name} vs {opponent_team[0]} в {message.text}", reply_markup=commander_menu)
+            await bot.send_message(opponent_id, f"✅ Матч назначен: {opponent_team[0]} vs {team_name} в {message.text}", reply_markup=commander_menu)
+        else:
+            await message.answer("Ошибка: у соперника нет названия команды.")
+    else:
+        await message.answer(f"Слот {message.text} выбран! Ждём соперника...", reply_markup=commander_menu)
+
+# --- Мои матчи ---
+@dp.message(F.text == "Мои матчи")
+async def commander_my_matches(message: types.Message):
+    user_id = message.from_user.id
+    team = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (user_id,)).fetchone()
+
+    if not team:
+        await message.answer("Вы не зарегистрированы как командир.")
+        return
+
+    matches = cursor.execute("SELECT team1, team2, match_time, result FROM matches WHERE team1 = ? OR team2 = ?", (team[0], team[0])).fetchall()
+
+    if not matches:
+        await message.answer("У вашей команды пока нет матчей.")
+        return
+
+    reply = f"Матчи команды {team[0]}:\n"
+    for m in matches:
+        time = datetime.fromisoformat(m[2]).strftime("%d.%m %H:%M")
+        reply += f"{m[0]} vs {m[1]} — {time} — {m[3] or 'ещё не сыгран'}\n"
+
+    await message.answer(reply)
+
+# --- Судья: добавить результат ---
 @dp.message(F.text == "Добавить результат матча")
 async def judge_add_result(message: types.Message):
     matches = cursor.execute("SELECT id, team1, team2, match_time FROM matches WHERE result IS NULL").fetchall()
     if not matches:
-        await message.answer("Нет матчей без результатов.")
+        await message.answer("Нет матчей для внесения результатов.", reply_markup=judge_menu)
         return
 
-    reply = "Выберите матч и укажите результат (формат: <id>. Победила команда ...):\n"
-    for m in matches:
-        reply += f"{m[0]}. {m[1]} vs {m[2]} — {m[3]}\n"
-    await message.answer(reply)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=f"{m[0]}: {m[1]} vs {m[2]} ({datetime.fromisoformat(m[3]).strftime('%d.%m %H:%M')})")] for m in matches],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите матч для внесения результата:", reply_markup=kb)
 
+@dp.message(F.text.regexp(r"^\d+:"))
+async def process_match_choice(message: types.Message):
+    match_id = int(message.text.split(":")[0])
+    cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (message.from_user.id, f"judge_match_{match_id}"))
+    conn.commit()
+    await message.answer("Введите результат в формате 'Команда1 X:Y Команда2'")
 
-@dp.message(F.text.regexp(r"^\d+\..*"))
-async def save_result(message: types.Message):
-    try:
-        match_id, result = message.text.split(".", 1)
-        match_id = int(match_id.strip())
-        result = result.strip()
-
-        cursor.execute("UPDATE matches SET result = ? WHERE id = ?", (result, match_id))
+@dp.message(F.text.regexp(r".+ \d+:\d+ .+"))
+async def process_result(message: types.Message):
+    role = cursor.execute("SELECT role FROM roles WHERE user_id = ?", (message.from_user.id,)).fetchone()
+    if role and role[0].startswith("judge_match_"):
+        match_id = int(role[0].split("_")[-1])
+        cursor.execute("UPDATE matches SET result = ?, judge_id = ? WHERE id = ?", (message.text, message.from_user.id, match_id))
         conn.commit()
+        cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (message.from_user.id, "judge"))
+        conn.commit()
+        await message.answer("Результат записан ✅", reply_markup=judge_menu)
 
-        await message.answer(f"Результат для матча {match_id} сохранён: {result}")
-    except Exception:
-        await message.answer("Ошибка при сохранении результата. Используйте формат:\n1. Победила команда A")
-
-
-# --- Просмотр прошедших матчей ---
+# --- Судья: результаты за сегодня ---
 @dp.message(F.text == "Результаты за сегодня")
-async def today_results(message: types.Message):
-    today = datetime.now().strftime("%Y-%m-%d")
-    matches = cursor.execute(
-        "SELECT team1, team2, match_time, result FROM matches WHERE date(match_time) = ?", (today,)
-    ).fetchall()
+async def judge_results_today(message: types.Message):
+    today = datetime.now().date()
+    matches = cursor.execute("SELECT team1, team2, match_time, result FROM matches WHERE result IS NOT NULL").fetchall()
+    today_matches = [m for m in matches if datetime.fromisoformat(m[2]).date() == today]
 
-    if not matches:
-        await message.answer("Сегодня матчей не было.")
+    if not today_matches:
+        await message.answer("Сегодня матчей ещё не было.", reply_markup=judge_menu)
         return
 
-    reply = f"Матчи за {today}:\n"
-    for m in matches:
-        reply += f"{m[0]} vs {m[1]} — {m[3] or 'ещё не сыгран'}\n"
+    reply = "Результаты за сегодня:\n"
+    for m in today_matches:
+        reply += f"{m[0]} vs {m[1]} — {m[3]}\n"
 
-    await message.answer(reply)
+    await message.answer(reply, reply_markup=judge_menu)
 
-
-# === Запуск ===
+# --- Запуск ---
 async def main():
-    print("✅ Бот запущен...")
-    await bot.delete_webhook(drop_pending_updates=True)  # очищаем вебхуки
+    print("Бот запущен...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
