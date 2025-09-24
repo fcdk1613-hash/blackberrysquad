@@ -248,15 +248,47 @@ async def results_by_date(message: types.Message):
 @dp.callback_query(F.data.startswith("resdate:"))
 async def show_results(callback: types.CallbackQuery):
     date = callback.data.split(":")[1]
-    cursor.execute("SELECT time, result FROM matches WHERE date=? AND result IS NOT NULL", (date,))
-    results = cursor.fetchall()
 
-    if not results:
+    # получаем уникальные времена для которых есть результат
+    cursor.execute("SELECT DISTINCT time FROM matches WHERE date=? AND result IS NOT NULL ORDER BY time", (date,))
+    times = [r[0] for r in cursor.fetchall()]
+
+    if not times:
         await callback.message.answer("Нет результатов на эту дату.")
+        await callback.answer()
         return
 
-    text = "\n".join([f"{t} — {r}" for t, r in results])
+    text_lines = []
+    for t in times:
+        # берем одну запись с результатом для этого времени (представитель)
+        cursor.execute("SELECT id, team_id, result FROM matches WHERE date=? AND time=? AND result IS NOT NULL LIMIT 1", (date, t))
+        rep = cursor.fetchone()
+        if not rep:
+            continue
+        rep_id, team_a_id, result_text = rep
+
+        # ищем соперника в той же паре (если есть)
+        cursor.execute("SELECT team_id FROM matches WHERE date=? AND time=? AND team_id!=? LIMIT 1", (date, t, team_a_id))
+        opp = cursor.fetchone()
+        team_b_id = opp[0] if opp else None
+
+        # получаем имена команд (если есть) из таблицы commanders
+        cursor.execute("SELECT team_name FROM commanders WHERE user_id=?", (team_a_id,))
+        row_a = cursor.fetchone()
+        name_a = row_a[0] if row_a and row_a[0] else str(team_a_id)
+
+        if team_b_id:
+            cursor.execute("SELECT team_name FROM commanders WHERE user_id=?", (team_b_id,))
+            row_b = cursor.fetchone()
+            name_b = row_b[0] if row_b and row_b[0] else str(team_b_id)
+        else:
+            name_b = "???"
+
+        text_lines.append(f"{t} — {name_a} vs {name_b} — {result_text}")
+
+    text = "\n".join(text_lines)
     await callback.message.answer(f"📊 Результаты за {date}:\n{text}")
+    await callback.answer()
 
 # ---------------- START ---------------- #
 async def main():
