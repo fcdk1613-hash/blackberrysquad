@@ -1,38 +1,38 @@
-# bot.py
 import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
-# === Вставь свой токен сюда ===
+# === Настройки ===
 API_TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# === DB: используем check_same_thread=False чтобы избежать проблем в asyncio handlers ===
-conn = sqlite3.connect("tournament.db", check_same_thread=False)
+# === База данных ===
+conn = sqlite3.connect("tournament.db")
 cursor = conn.cursor()
 
-# === Создаём таблицы ===
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS commanders (
-    user_id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER UNIQUE,
     phone TEXT,
     team_name TEXT
 )
 """)
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS judges (
-    user_id INTEGER PRIMARY KEY,
-    phone TEXT,
-    name TEXT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER UNIQUE,
+    phone TEXT
 )
 """)
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS matches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,21 +43,10 @@ CREATE TABLE IF NOT EXISTS matches (
     judge_id INTEGER
 )
 """)
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS roles (
-    user_id INTEGER PRIMARY KEY,
-    role TEXT
-)
-""")
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS temp_schedule (
-    user_id INTEGER PRIMARY KEY,
-    datetime TEXT
-)
-""")
+
 conn.commit()
 
-# === Keyboards ===
+# === Кнопки ===
 role_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Я - командир")],
@@ -66,335 +55,202 @@ role_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-contact_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Отправить номер", request_contact=True)]],
+contact_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton("📱 Поделиться номером", request_contact=True)]],
     resize_keyboard=True
 )
 
-commander_menu = ReplyKeyboardMarkup(
+main_keyboard_commander = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Запланировать матч")],
-        [KeyboardButton(text="Мои матчи")]
+        [KeyboardButton("Запланировать матч")],
+        [KeyboardButton("Мои матчи")]
     ],
     resize_keyboard=True
 )
 
-judge_menu = ReplyKeyboardMarkup(
+main_keyboard_judge = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Добавить результат матча")],
-        [KeyboardButton(text="Результаты за сегодня")]
+        [KeyboardButton("Добавить результат матча")],
+        [KeyboardButton("Результаты за сегодня")]
     ],
     resize_keyboard=True
 )
+
+# === Временное хранилище состояния ===
+user_state = {}
 
 # === Bot & Dispatcher ===
-bot = Bot(token=API_TOKEN, parse_mode="HTML")
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# временное хранилище для процесса планирования / внесения результата
-user_state = {}  # user_id -> dict
-
-# --------------------------
-# /start и выбор роли
-# --------------------------
+# === Старт ===
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    await message.answer("Привет! Выберите роль:", reply_markup=role_keyboard)
+async def start(message: types.Message):
+    await message.answer("Привет! 👋 Выберите, кто вы:", reply_markup=role_keyboard)
 
+# === Выбор роли ===
+@dp.message(F.text.in_(["Я - командир", "Я - судья"]))
+async def choose_role(message: types.Message):
+    role = "commander" if "командир" in message.text else "judge"
+    user_state[message.from_user.id] = {"role": role}
+    await message.answer("Теперь отправьте свой номер телефона:", reply_markup=contact_keyboard)
 
-@dp.message(F.text == "Я - командир")
-async def choose_commander(message: types.Message):
-    user_id = message.from_user.id
-    cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (user_id, "commander"))
-    conn.commit()
-    await message.answer("Нажмите кнопку, чтобы отправить номер телефона:", reply_markup=contact_kb)
+# === Получение телефона ===
+@dp.message(F.contact)
+async def get_contact(message: types.Message):
+    uid = message.from_user.id
+    phone = message.contact.phone_number
+    role = user_state.get(uid, {}).get("role")
 
-
-@dp.message(F.text == "Я - судья")
-async def choose_judge(message: types.Message):
-    user_id = message.from_user.id
-    cursor.execute("INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)", (user_id, "judge"))
-    conn.commit()
-    await message.answer("Нажмите кнопку, чтобы отправить номер телефона:", reply_markup=contact_kb)
-
-
-# --------------------------
-# Обработка контакта (номер телефона)
-# --------------------------
-@dp.message(F.content_type == types.ContentType.CONTACT)
-async def process_contact(message: types.Message):
-    contact = message.contact
-    user_id = message.from_user.id
-    phone = contact.phone_number
-
-    role_row = cursor.execute("SELECT role FROM roles WHERE user_id = ?", (user_id,)).fetchone()
-    if not role_row:
-        await message.answer("Сначала выберите роль (командир или судья).", reply_markup=role_keyboard)
-        return
-
-    role = role_row[0]
     if role == "commander":
-        # создаём запись командирa, team_name пока NULL
-        cursor.execute("INSERT OR REPLACE INTO commanders (user_id, phone, team_name) VALUES (?, ?, ?)",
-                       (user_id, phone, None))
-        conn.commit()
-        await message.answer("Отлично. Теперь пришлите, пожалуйста, название вашей команды (текстом).",
-                             reply_markup=ReplyKeyboardRemove())
-    else:  # judge
-        cursor.execute("INSERT OR REPLACE INTO judges (user_id, phone, name) VALUES (?, ?, ?)",
-                       (user_id, phone, message.from_user.full_name))
-        conn.commit()
-        await message.answer("✅ Вы зарегистрированы как судья.", reply_markup=judge_menu)
+        user_state[uid]["phone"] = phone
+        await message.answer("Введите название вашей команды:", reply_markup=ReplyKeyboardRemove())
+        user_state[uid]["step"] = "team_name"
 
-
-# --------------------------
-# Сохранение названия команды (только если команда не задана)
-# --------------------------
-@dp.message(F.text & ~F.via_bot & ~F.contact)
-async def save_team_name_or_ignore(message: types.Message):
-    user_id = message.from_user.id
-    # проверяем, ожидает ли пользователь ввод названия команды (есть запись в commanders, team_name IS NULL)
-    row = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?",
-                         (user_id,)).fetchone()
-    if row and row[0] is None:
-        team_name = message.text.strip()
-        if not team_name:
-            await message.answer("Название команды не может быть пустым. Попробуйте снова.")
-            return
-        cursor.execute("UPDATE commanders SET team_name = ? WHERE user_id = ?", (team_name, user_id))
+    elif role == "judge":
+        cursor.execute("INSERT OR REPLACE INTO judges (user_id, phone) VALUES (?, ?)", (uid, phone))
         conn.commit()
-        await message.answer(f"✅ Команда <b>{team_name}</b> зарегистрирована!", reply_markup=commander_menu)
+        await message.answer("✅ Вы зарегистрированы как судья!", reply_markup=main_keyboard_judge)
+
+# === Название команды ===
+@dp.message(F.text)
+async def text_handler(message: types.Message):
+    uid = message.from_user.id
+    state = user_state.get(uid, {})
+
+    # шаг: название команды
+    if state.get("step") == "team_name":
+        phone = state["phone"]
+        team = message.text
+        cursor.execute("INSERT OR REPLACE INTO commanders (user_id, phone, team_name) VALUES (?, ?, ?)", (uid, phone, team))
+        conn.commit()
+        await message.answer(f"✅ Команда '{team}' зарегистрирована!", reply_markup=main_keyboard_commander)
+        user_state[uid] = {}
         return
 
-    # иначе — не блокируем, даём возможности дальше (следующие хендлеры сработают по тексту)
-    # просто возвращаем, чтобы не мешать остальным
-    return
+    # шаг: выбор времени матча
+    if state.get("step") == "choose_time":
+        chosen_time = message.text
+        if chosen_time not in state["options"]:
+            await message.answer("⚠️ Выберите время только из списка кнопок.")
+            return
 
+        cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (uid,))
+        team = cursor.fetchone()[0]
 
-# --------------------------
-# Командир: планирование матча
-# --------------------------
+        cursor.execute("INSERT INTO matches (team1, datetime) VALUES (?, ?)", (team, chosen_time))
+        conn.commit()
+
+        await message.answer(f"📅 Матч запланирован на {chosen_time}", reply_markup=main_keyboard_commander)
+        user_state[uid] = {}
+        return
+
+    # шаг: добавление результата судьёй
+    if state.get("step") == "add_result":
+        match_id = state["match_id"]
+        result = message.text
+        cursor.execute("UPDATE matches SET result = ?, judge_id = ? WHERE id = ?", (result, uid, match_id))
+        conn.commit()
+        await message.answer("✅ Результат добавлен!", reply_markup=main_keyboard_judge)
+        user_state[uid] = {}
+        return
+
+# === Командиры ===
 @dp.message(F.text == "Запланировать матч")
-async def plan_match_start(message: types.Message):
-    user_id = message.from_user.id
-    # проверим, что пользователь — командир с заданным team_name
-    row = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (user_id,)).fetchone()
-    if not row or not row[0]:
-        await message.answer("Вы не зарегистрированы как командир или не задали название команды. Сначала зарегистрируйтесь.")
-        return
-
-    # готовим список дат: остаток недели (включительно)
+async def plan_match(message: types.Message):
+    uid = message.from_user.id
     today = datetime.now().date()
-    days_to_end = 6 - today.weekday() if today.weekday() <= 6 else 0
-    dates = [today + timedelta(days=i) for i in range(days_to_end + 1)]
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=d.isoformat())] for d in dates], resize_keyboard=True)
+    options = []
 
-    # устанавливаем состояние ожидания выбора даты
-    user_state[user_id] = {"action": "scheduling"}
-    await message.answer("Выберите дату (остаток недели):", reply_markup=kb)
+    for i in range((6 - today.weekday()) + 1):  # остаток недели
+        day = today + timedelta(days=i)
+        for hour in range(19, 22):
+            for minute in [0, 30]:
+                dt = datetime.combine(day, datetime.min.time()).replace(hour=hour, minute=minute)
+                options.append(dt.strftime("%Y-%m-%d %H:%M"))
 
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=o)] for o in options],
+        resize_keyboard=True
+    )
 
-@dp.message(F.text.regexp(r"^\d{4}-\d{2}-\d{2}$"))
-async def plan_match_choose_date(message: types.Message):
-    user_id = message.from_user.id
-    state = user_state.get(user_id)
-    if not state or state.get("action") != "scheduling":
-        return  # не в процессе планирования — игнорируем
+    user_state[uid] = {"step": "choose_time", "options": options}
+    await message.answer("Выберите дату и время:", reply_markup=kb)
 
-    date_str = message.text  # YYYY-MM-DD
-    # сохраняем в состоянии
-    state["date"] = date_str
-
-    # генерируем времена 19:00..22:00 шаг 30 минут
-    times = []
-    hh = 19
-    mm = 0
-    while True:
-        times.append(f"{hh:02d}:{mm:02d}")
-        # шаг
-        mm += 30
-        if mm == 60:
-            hh += 1
-            mm = 0
-        if hh > 22 or (hh == 22 and mm > 0):
-            break
-
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t)] for t in times], resize_keyboard=True)
-    await message.answer("Выберите время (шаг 30 минут, 19:00–22:00):", reply_markup=kb)
-
-
-@dp.message(F.text.regexp(r"^\d{2}:\d{2}$"))
-async def plan_match_choose_time(message: types.Message):
-    user_id = message.from_user.id
-    state = user_state.get(user_id)
-    if not state or state.get("action") != "scheduling" or "date" not in state:
-        return
-
-    date_str = state["date"]            # YYYY-MM-DD
-    time_str = message.text             # HH:MM
-    dt_str = f"{date_str} {time_str}"   # store as "YYYY-MM-DD HH:MM"
-
-    # проверяем, есть ли у пользователя team_name
-    row = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (user_id,)).fetchone()
-    if not row or not row[0]:
-        await message.answer("Ошибка: у вас нет зарегистрированной команды.")
-        user_state.pop(user_id, None)
-        return
-    team_name = row[0]
-
-    # Сначала проверим, есть ли другой пользователь в temp_schedule на это время
-    opponent = cursor.execute(
-        "SELECT user_id FROM temp_schedule WHERE datetime = ? AND user_id != ?",
-        (dt_str, user_id)
-    ).fetchone()
-
-    if opponent:
-        opponent_id = opponent[0]
-        # проверим, что у оппонента есть команда
-        opp_team_row = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (opponent_id,)).fetchone()
-        if not opp_team_row or not opp_team_row[0]:
-            # удаляем запись оппонента и ставим нашу в temp, но лучше оповестить
-            cursor.execute("DELETE FROM temp_schedule WHERE user_id = ?", (opponent_id,))
-            conn.commit()
-            # вставляем текущего в temp (чтобы ждать)
-            cursor.execute("INSERT OR REPLACE INTO temp_schedule (user_id, datetime) VALUES (?, ?)", (user_id, dt_str))
-            conn.commit()
-            await message.answer("Соперник выбрал слот, но у него нет названия команды. Вы добавлены в ожидание.", reply_markup=commander_menu)
-            user_state.pop(user_id, None)
-            return
-
-        opponent_team = opp_team_row[0]
-
-        # Создаём матч с двумя командами
-        cursor.execute("INSERT INTO matches (team1, team2, datetime, result, judge_id) VALUES (?, ?, ?, ?, ?)",
-                       (team_name, opponent_team, dt_str, None, None))
-        conn.commit()
-
-        # Удаляем temp_schedule записи для данного слота (для обоих)
-        cursor.execute("DELETE FROM temp_schedule WHERE datetime = ?", (dt_str,))
-        conn.commit()
-
-        # оповещаем обе стороны
-        await bot.send_message(user_id, f"✅ Матч назначен: {team_name} vs {opponent_team} в {dt_str}", reply_markup=commander_menu)
-        await bot.send_message(opponent_id, f"✅ Матч назначен: {opponent_team} vs {team_name} в {dt_str}", reply_markup=commander_menu)
-    else:
-        # нет соперника — добавляем запись в temp_schedule и говорим ждать
-        cursor.execute("INSERT OR REPLACE INTO temp_schedule (user_id, datetime) VALUES (?, ?)", (user_id, dt_str))
-        conn.commit()
-        await message.answer(f"Слот {dt_str} выбран. Ждём соперника...", reply_markup=commander_menu)
-
-    # очищаем временное состояние планирования
-    user_state.pop(user_id, None)
-
-
-# --------------------------
-# Командир: Мои матчи
-# --------------------------
 @dp.message(F.text == "Мои матчи")
 async def my_matches(message: types.Message):
-    user_id = message.from_user.id
-    row = cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (user_id,)).fetchone()
-    if not row or not row[0]:
-        await message.answer("Вы не зарегистрированы как командир или не задали название команды.")
-        return
-    team_name = row[0]
-
-    rows = cursor.execute("SELECT team1, team2, datetime, result FROM matches WHERE team1 = ? OR team2 = ?",
-                          (team_name, team_name)).fetchall()
-    if not rows:
-        await message.answer("У вашей команды пока нет матчей.")
+    uid = message.from_user.id
+    cursor.execute("SELECT team_name FROM commanders WHERE user_id = ?", (uid,))
+    row = cursor.fetchone()
+    if not row:
+        await message.answer("⚠️ Вы не зарегистрированы.")
         return
 
-    text = f"Матчи команды {team_name}:\n\n"
-    for r in rows:
-        opp = r[1] if r[0] == team_name else r[0]
-        dt_display = r[2]
-        result = r[3] or "ещё не сыгран"
-        text += f"{dt_display} — vs {opp} — {result}\n"
-    await message.answer(text)
+    team = row[0]
+    cursor.execute("SELECT datetime, result FROM matches WHERE team1 = ?", (team,))
+    matches = cursor.fetchall()
 
+    if not matches:
+        await message.answer("📭 У вас пока нет матчей.")
+    else:
+        text = "📖 Ваши матчи:\n"
+        for m in matches:
+            text += f"{m[0]} — {m[1] if m[1] else 'ожидается результат'}\n"
+        await message.answer(text)
 
-# --------------------------
-# Судья: Добавить результат
-# --------------------------
+# === Судьи ===
 @dp.message(F.text == "Добавить результат матча")
-async def judge_list_matches(message: types.Message):
-    rows = cursor.execute("SELECT id, team1, team2, datetime FROM matches WHERE result IS NULL AND team2 IS NOT NULL").fetchall()
-    if not rows:
-        await message.answer("Нет матчей без результата для внесения.", reply_markup=judge_menu)
+async def add_result(message: types.Message):
+    cursor.execute("SELECT id, team1, datetime, result FROM matches WHERE result IS NULL")
+    matches = cursor.fetchall()
+
+    if not matches:
+        await message.answer("⚠️ Нет матчей без результата.")
         return
 
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=f"{r[0]}: {r[1]} vs {r[2]} ({r[3]})")] for r in rows],
-                             resize_keyboard=True)
-    await message.answer("Выберите матч для внесения результата:", reply_markup=kb)
+    text = "Выберите ID матча для добавления результата:\n"
+    for m in matches:
+        text += f"ID {m[0]} — {m[1]} ({m[2]})\n"
 
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=f"ID {m[0]}")] for m in matches],
+        resize_keyboard=True
+    )
 
-@dp.message(F.text.regexp(r"^\d+:"))
-async def judge_choose_match(message: types.Message):
-    # формат кнопки: "ID: team1 vs team2 (datetime)"
-    match_id = int(message.text.split(":")[0])
-    user_state[message.from_user.id] = {"action": "enter_result", "match_id": match_id}
-    await message.answer("Введите результат произвольным текстом (напр., 'TeamA 2:1 TeamB' или '2:1')")
+    user_state[message.from_user.id] = {"step": "pick_match", "matches": matches}
+    await message.answer(text, reply_markup=kb)
 
+@dp.message(F.text.regexp(r"^ID \d+$"))
+async def pick_match(message: types.Message):
+    uid = message.from_user.id
+    match_id = int(message.text.split()[1])
 
-@dp.message(F.text & ~F.via_bot & ~F.contact)
-async def judge_enter_result(message: types.Message):
-    state = user_state.get(message.from_user.id)
-    if not state or state.get("action") != "enter_result":
-        return  # не в состоянии ввода результата
+    cursor.execute("SELECT id FROM matches WHERE id = ?", (match_id,))
+    if not cursor.fetchone():
+        await message.answer("⚠️ Такого матча нет.")
+        return
 
-    match_id = state["match_id"]
-    result_text = message.text.strip()
-    cursor.execute("UPDATE matches SET result = ?, judge_id = ? WHERE id = ?",
-                   (result_text, message.from_user.id, match_id))
-    conn.commit()
+    user_state[uid] = {"step": "add_result", "match_id": match_id}
+    await message.answer("Введите результат матча (например: TeamA 3:2 TeamB)", reply_markup=ReplyKeyboardRemove())
 
-    await message.answer("✅ Результат сохранён.", reply_markup=judge_menu)
-    user_state.pop(message.from_user.id, None)
-
-
-# --------------------------
-# Судья: Результаты за сегодня
-# --------------------------
 @dp.message(F.text == "Результаты за сегодня")
-async def judge_results_today(message: types.Message):
-    today_str = datetime.now().date().isoformat()
-    rows = cursor.execute("SELECT team1, team2, datetime, result FROM matches WHERE date(datetime) = ? AND result IS NOT NULL",
-                          (today_str,)).fetchall()
-    if not rows:
-        await message.answer("Сегодня ещё не было завершённых матчей.", reply_markup=judge_menu)
-        return
+async def today_results(message: types.Message):
+    today = datetime.now().date()
+    cursor.execute("SELECT team1, datetime, result FROM matches WHERE date(datetime) = ?", (today,))
+    matches = cursor.fetchall()
 
-    text = "Результаты за сегодня:\n\n"
-    for r in rows:
-        text += f"{r[2]} — {r[0]} vs {r[1]} — {r[3]}\n"
-    await message.answer(text, reply_markup=judge_menu)
+    if not matches:
+        await message.answer("Сегодня ещё не было матчей.")
+    else:
+        text = "📊 Результаты за сегодня:\n"
+        for m in matches:
+            text += f"{m[1]} — {m[0]} — {m[2] if m[2] else 'без результата'}\n"
+        await message.answer(text)
 
-
-# --------------------------
-# Отладочный (fallback) — не мешаем рабочим кнопкам
-# --------------------------
-@dp.message(F.text)
-async def fallback_debug(message: types.Message):
-    # Игнорируем стандартные кнопки (они обрабатываются выше).
-    known = {
-        "Запланировать матч", "Мои матчи",
-        "Добавить результат матча", "Результаты за сегодня",
-        "Я - командир", "Я - судья", "Отправить номер"
-    }
-    if message.text not in known:
-        logger.info("📩 Необработанное сообщение: %s (from %s)", message.text, message.from_user.id)
-
-
-# --------------------------
-# Запуск
-# --------------------------
+# === Запуск ===
 async def main():
-    logger.info("Запуск бота, удаляю webhooks (если были)")
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Start polling")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
