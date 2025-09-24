@@ -252,7 +252,7 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
                        (opp_team_id, user_id, date_iso, time_str))
         conn.commit()
         # Удаляем все заявки на этот слот
-        cursor.execute("DELETE FROM match_requests WHERE date = ? AND time = ?", (date_iso, time_str))
+        cursor.execute("DELETE FROM match_requests WHERE date = ? AND time = ? AND team1_id NOT IN", (date_iso, time_str))
         conn.commit()
 
         # Получаем названия команд
