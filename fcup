@@ -1,75 +1,89 @@
+import asyncio
 import sqlite3
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-import asyncio
 
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton
+)
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+
+# 🔑 Токен вставляем вручную
 API_TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
 
-# Подключение к БД
+# --- Настройка бота ---
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher(storage=MemoryStorage())
+
+# --- База данных ---
 conn = sqlite3.connect("tournament.db")
 cursor = conn.cursor()
 
-# Таблицы
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
+    phone TEXT,
     role TEXT,
-    team_name TEXT,
-    phone TEXT
+    team_name TEXT
 )
 """)
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS matches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER,
+    team1_id INTEGER,
+    team2_id INTEGER,
     date TEXT,
     time TEXT,
-    result TEXT,
-    FOREIGN KEY (team_id) REFERENCES users (user_id)
+    result TEXT
 )
 """)
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS match_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_id INTEGER,
-    date TEXT,
-    time TEXT,
-    FOREIGN KEY (team_id) REFERENCES users (user_id)
-)
-""")
-
 conn.commit()
 
-# FSM
+# --- Состояния ---
 class Register(StatesGroup):
     choosing_role = State()
-    entering_team = State()
-    entering_phone = State()
+    waiting_for_phone = State()
+    waiting_for_team_name = State()
 
+class Commander(StatesGroup):
+    choosing_date = State()
+    choosing_time = State()
 
-# Бот
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+class Referee(StatesGroup):
+    choosing_match = State()
+    entering_result = State()
 
-
-# Главное меню
+# --- Меню ---
 def main_menu(role: str):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
     if role == "commander":
-        kb.add(KeyboardButton("📅 Назначить игру"))
-        kb.add(KeyboardButton("📖 Мое расписание"))
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📅 Назначить игру")],
+                [KeyboardButton(text="📖 Мое расписание")]
+            ],
+            resize_keyboard=True
+        )
     elif role == "referee":
-        kb.add(KeyboardButton("📖 Список игр"))
-    return kb
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📖 Список игр")]
+            ],
+            resize_keyboard=True
+        )
+    else:
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Ошибка")]],
+            resize_keyboard=True
+        )
 
-
-# Старт
+# --- Старт ---
 @dp.message(Command("start"))
 async def start(message: Message, state: FSMContext):
     cursor.execute("SELECT role FROM users WHERE user_id=?", (message.from_user.id,))
@@ -77,140 +91,154 @@ async def start(message: Message, state: FSMContext):
     if user:
         await message.answer("Вы уже зарегистрированы ✅", reply_markup=main_menu(user[0]))
     else:
-        kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add(KeyboardButton("👨‍✈️ Командир"), KeyboardButton("⚖️ Судья"))
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="👨‍✈️ Командир"), KeyboardButton(text="⚖️ Судья")]
+            ],
+            resize_keyboard=True
+        )
         await message.answer("Выберите роль:", reply_markup=kb)
         await state.set_state(Register.choosing_role)
 
-
-# Выбор роли
-@dp.message(Register.choosing_role)
+# --- Выбор роли ---
+@dp.message(Register.choosing_role, F.text.in_(["👨‍✈️ Командир", "⚖️ Судья"]))
 async def choose_role(message: Message, state: FSMContext):
-    if message.text == "👨‍✈️ Командир":
-        await state.update_data(role="commander")
-        await message.answer("Введите название вашей команды:")
-        await state.set_state(Register.entering_team)
-    elif message.text == "⚖️ Судья":
-        await state.update_data(role="referee")
-        kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        kb.add(KeyboardButton("📱 Поделиться номером", request_contact=True))
-        await message.answer("Поделитесь номером телефона:", reply_markup=kb)
-        await state.set_state(Register.entering_phone)
+    role = "commander" if message.text == "👨‍✈️ Командир" else "referee"
+    await state.update_data(role=role)
 
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True
+    )
+    await message.answer("Поделитесь номером телефона 📱", reply_markup=kb)
+    await state.set_state(Register.waiting_for_phone)
 
-# Ввод команды
-@dp.message(Register.entering_team)
-async def enter_team(message: Message, state: FSMContext):
+# --- Получение телефона ---
+@dp.message(Register.waiting_for_phone, F.contact)
+async def register_phone(message: Message, state: FSMContext):
     data = await state.get_data()
-    cursor.execute("INSERT INTO users (user_id, role, team_name) VALUES (?, ?, ?)",
-                   (message.from_user.id, data["role"], message.text))
+    role = data["role"]
+
+    cursor.execute(
+        "INSERT OR REPLACE INTO users (user_id, phone, role) VALUES (?, ?, ?)",
+        (message.from_user.id, message.contact.phone_number, role)
+    )
     conn.commit()
-    await message.answer("Регистрация завершена ✅", reply_markup=main_menu("commander"))
+
+    if role == "commander":
+        await message.answer("Введите название вашей команды 🏷️")
+        await state.set_state(Register.waiting_for_team_name)
+    else:
+        await message.answer("Вы зарегистрированы как судья ⚖️", reply_markup=main_menu("referee"))
+        await state.clear()
+
+# --- Получение названия команды ---
+@dp.message(Register.waiting_for_team_name)
+async def register_team(message: Message, state: FSMContext):
+    team_name = message.text
+    cursor.execute("UPDATE users SET team_name=? WHERE user_id=?", (team_name, message.from_user.id))
+    conn.commit()
+
+    await message.answer(f"Команда <b>{team_name}</b> успешно зарегистрирована ✅",
+                         reply_markup=main_menu("commander"))
     await state.clear()
 
-
-# Телефон судьи
-@dp.message(Register.entering_phone)
-async def enter_phone(message: Message, state: FSMContext):
-    data = await state.get_data()
-    phone = message.contact.phone_number if message.contact else message.text
-    cursor.execute("INSERT INTO users (user_id, role, phone) VALUES (?, ?, ?)",
-                   (message.from_user.id, data["role"], phone))
-    conn.commit()
-    await message.answer("Регистрация завершена ✅", reply_markup=main_menu("referee"))
-    await state.clear()
-
-
-# Назначить игру
+# --- Назначение игры ---
 @dp.message(F.text == "📅 Назначить игру")
-async def schedule_game(message: Message):
-    today = datetime.now()
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
+async def choose_date(message: Message, state: FSMContext):
+    today = datetime.today()
+    dates = [(today + timedelta(days=i)).strftime("%d.%m") for i in range(7)]
 
-    for i in range(7):  # 7 дней вперед
-        day = today + timedelta(days=i)
-        date_str = day.strftime("%Y-%m-%d")
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=d)] for d in dates],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите дату 📅", reply_markup=kb)
+    await state.set_state(Commander.choosing_date)
 
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(text=f"{date_str} 20:00", callback_data=f"{date_str}_20:00"),
-            InlineKeyboardButton(text=f"{date_str} 21:00", callback_data=f"{date_str}_21:00")
-        ])
+@dp.message(Commander.choosing_date)
+async def choose_time(message: Message, state: FSMContext):
+    await state.update_data(date=message.text)
 
-    await message.answer("Выберите дату и время для игры:", reply_markup=kb)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="20:00")],
+            [KeyboardButton(text="21:00")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Выберите время 🕒", reply_markup=kb)
+    await state.set_state(Commander.choosing_time)
 
+@dp.message(Commander.choosing_time)
+async def save_game_slot(message: Message, state: FSMContext):
+    data = await state.get_data()
+    date, time = data["date"], message.text
+    user_id = message.from_user.id
 
-# Обработка выбора даты/времени
-@dp.callback_query(F.data.contains("_"))
-async def save_game_slot(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    date, time = callback.data.split("_")
+    # Проверяем, есть ли свободная пара
+    cursor.execute("SELECT id, team1_id, team2_id FROM matches WHERE date=? AND time=?", (date, time))
+    existing_match = cursor.fetchone()
 
-    # Проверяем наличие соперника
-    cursor.execute("SELECT team_id FROM match_requests WHERE date=? AND time=? AND team_id<>?",
-                   (date, time, user_id))
-    opponent = cursor.fetchone()
-
-    if opponent:
-        # Создаём матч
-        cursor.execute("INSERT INTO matches (team_id, date, time, result) VALUES (?, ?, ?, ?)",
-                       (user_id, date, time, None))
-        cursor.execute("INSERT INTO matches (team_id, date, time, result) VALUES (?, ?, ?, ?)",
-                       (opponent[0], date, time, None))
-        conn.commit()
-
-        # Удаляем заявки
-        cursor.execute("DELETE FROM match_requests WHERE date=? AND time=?", (date, time))
-        conn.commit()
-
-        await callback.message.answer(f"Матч назначен на {date} {time} ✅")
-        await bot.send_message(opponent[0], f"Матч назначен на {date} {time} ✅")
+    if existing_match:
+        # Если слот уже занят одной командой — добавляем вторую
+        if existing_match[1] and not existing_match[2]:
+            cursor.execute("UPDATE matches SET team2_id=? WHERE id=?", (user_id, existing_match[0]))
+            conn.commit()
+            await message.answer("✅ Матч назначен! Ваша команда добавлена как соперник.", reply_markup=main_menu("commander"))
+        else:
+            await message.answer("⚠️ Этот слот уже занят двумя командами, выберите другой.", reply_markup=main_menu("commander"))
     else:
-        # Сохраняем заявку
-        cursor.execute("INSERT INTO match_requests (team_id, date, time) VALUES (?, ?, ?)",
-                       (user_id, date, time))
+        # Создаём новый слот
+        cursor.execute("INSERT INTO matches (team1_id, date, time) VALUES (?, ?, ?)", (user_id, date, time))
         conn.commit()
-        await callback.message.answer(f"Заявка на {date} {time} сохранена. Ожидаем соперника ⏳")
+        await message.answer("✅ Вы выбрали слот, ждём соперника.", reply_markup=main_menu("commander"))
 
-    await callback.answer()
+    await state.clear()
 
-
-# Мое расписание
-@dp.message(F.text == "📖 Мое расписание")
-async def my_schedule(message: Message):
-    cursor.execute("SELECT date, time, result FROM matches WHERE team_id=?", (message.from_user.id,))
-    matches = cursor.fetchall()
-
-    if matches:
-        text = "Ваши матчи:\n\n"
-        for m in matches:
-            text += f"{m[0]} {m[1]} — {m[2] if m[2] else 'еще не сыгран'}\n"
-    else:
-        text = "У вас пока нет назначенных матчей."
-
-    await message.answer(text)
-
-
-# Список игр для судьи
+# --- Судья: список игр ---
 @dp.message(F.text == "📖 Список игр")
-async def list_matches(message: Message):
-    cursor.execute("SELECT date, time, team_id FROM matches")
+async def referee_matches(message: Message, state: FSMContext):
+    cursor.execute("SELECT id, team1_id, team2_id, date, time, result FROM matches")
     matches = cursor.fetchall()
 
-    if matches:
-        text = "Список назначенных игр:\n\n"
-        for m in matches:
-            cursor.execute("SELECT team_name FROM users WHERE user_id=?", (m[2],))
-            team = cursor.fetchone()
-            team_name = team[0] if team else "Неизвестная команда"
-            text += f"{m[0]} {m[1]} — {team_name}\n"
-    else:
-        text = "Матчей пока нет."
+    if not matches:
+        await message.answer("Пока нет назначенных матчей ⚠️")
+        return
+
+    text = "📖 <b>Список матчей:</b>\n\n"
+    for m in matches:
+        t1 = m[1] if m[1] else "?"
+        t2 = m[2] if m[2] else "?"
+        res = m[5] if m[5] else "⏳"
+        text += f"#{m[0]} | {t1} vs {t2} | {m[3]} {m[4]} | Результат: {res}\n"
 
     await message.answer(text)
 
+# --- Мое расписание ---
+@dp.message(F.text == "📖 Мое расписание")
+async def my_schedule(message: Message, state: FSMContext):
+    cursor.execute("SELECT id FROM users WHERE user_id=?", (message.from_user.id,))
+    user = cursor.fetchone()
+    if not user:
+        await message.answer("❌ Вы не зарегистрированы")
+        return
 
-# Запуск
+    cursor.execute("SELECT date, time, result FROM matches WHERE team1_id=? OR team2_id=?", (message.from_user.id, message.from_user.id))
+    matches = cursor.fetchall()
+
+    if not matches:
+        await message.answer("У вас пока нет назначенных матчей 📭")
+    else:
+        text = "📅 <b>Ваше расписание:</b>\n\n"
+        for m in matches:
+            res = m[2] if m[2] else "⏳"
+            text += f"{m[0]} {m[1]} | Результат: {res}\n"
+        await message.answer(text)
+
+# --- Запуск ---
 async def main():
+    print("✅ Бот запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
