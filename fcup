@@ -4,7 +4,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
-API_TOKEN = "8392821328:AAH8FWHQ1aRC0FThYTde0UxbxlWCU2YMZZ0"
+API_TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
 ADMIN_ID = @cheshir43  # сюда вставь свой Telegram ID
 
 bot = Bot(token=API_TOKEN)
