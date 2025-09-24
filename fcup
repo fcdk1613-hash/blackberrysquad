@@ -12,7 +12,7 @@ from aiogram.types import (
 )
 
 # === Настройки ===
-TOKEN = "ТОКЕН_ТВОЕГО_БОТА"
+TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"
 
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
