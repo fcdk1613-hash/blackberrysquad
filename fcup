@@ -75,6 +75,23 @@ contact_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Меню после регистрации
+commander_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Запланировать матч")],
+        [KeyboardButton(text="Мои матчи")]
+    ],
+    resize_keyboard=True
+)
+
+judge_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Добавить результат матча")],
+        [KeyboardButton(text="Результаты за сегодня")]
+    ],
+    resize_keyboard=True
+)
+
 # === Хэндлеры ===
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -121,7 +138,10 @@ async def process_contact(message: types.Message):
         cursor.execute("INSERT OR REPLACE INTO judges (user_id, phone, name) VALUES (?, ?, ?)",
                        (user_id, phone, message.from_user.full_name))
         conn.commit()
-        await message.answer("Вы зарегистрированы как судья!", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            "Вы зарегистрированы как судья!\nВыберите действие:",
+            reply_markup=judge_menu
+        )
 
 
 # --- Сохранение названия команды ---
@@ -135,7 +155,10 @@ async def save_team_name(message: types.Message):
     if commander:
         cursor.execute("UPDATE commanders SET team_name = ? WHERE user_id = ?", (message.text, user_id))
         conn.commit()
-        await message.answer(f"Команда <b>{message.text}</b> зарегистрирована!", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Команда <b>{message.text}</b> зарегистрирована!\nВыберите действие:",
+            reply_markup=commander_menu
+        )
 
 
 # --- Судья добавляет результаты ---
@@ -189,6 +212,7 @@ async def today_results(message: types.Message):
 # === Запуск ===
 async def main():
     print("✅ Бот запущен...")
+    await bot.delete_webhook(drop_pending_updates=True)  # очищаем вебхуки
     await dp.start_polling(bot)
 
 
