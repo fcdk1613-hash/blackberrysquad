@@ -146,6 +146,9 @@ async def save_team_name(message: types.Message):
             f"✅ Команда <b>{message.text}</b> зарегистрирована!\nВыберите действие:",
             reply_markup=commander_menu
         )
+    else:
+        # если это не ввод названия команды, просто игнорируем
+        return
 
 # --- Командир: Запланировать матч ---
 @dp.message(F.text == "Запланировать матч")
@@ -265,6 +268,11 @@ async def today_results(message: types.Message):
         reply += f"{m[0]} vs {m[1]} — {m[3] or 'ещё не сыгран'}\n"
 
     await message.answer(reply)
+
+# --- Отладка: показываем ВСЕ входящие сообщения ---
+@dp.message()
+async def debug_all(message: types.Message):
+    print("📩 Пришло сообщение:", message.text)
 
 # --- Запуск ---
 async def main():
