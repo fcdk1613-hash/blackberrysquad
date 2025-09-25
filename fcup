@@ -102,6 +102,12 @@ class JudgeStates(StatesGroup):
 class DeleteStates(StatesGroup):
     choosing_delete_match = State()
 
+# --- New: history FSM states (год -> месяц -> день)
+class HistoryStates(StatesGroup):
+    choosing_year = State()
+    choosing_month = State()
+    choosing_day = State()
+
 # --------------- Бот и диспетчер ---------------
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
@@ -434,35 +440,244 @@ async def my_matches(message: types.Message):
     conn.close()
     await message.answer("📜 Ваши матчи:\n" + "\n".join(text_lines))
 
+# ---- REPLACED: История матчей (пошаговый выбор: год -> месяц -> день) ----
 @dp.message(F.text == "📚 История матчей")
-async def my_history(message: types.Message):
+async def history_start(message: types.Message, state: FSMContext):
+    """
+    Шаг 1: показать список годов, в которых у команды есть сыгранные матчи (result IS NOT NULL).
+    Кнопка '🔙 Назад' возвращает в меню.
+    """
     user_id = message.from_user.id
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time, result FROM matches WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL ORDER BY date DESC, time", (user_id, user_id))
+    # выбираем годы только для матчей этой команды, где есть результат
+    cur.execute("""
+        SELECT DISTINCT strftime('%Y', date) as year
+        FROM matches
+        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+        ORDER BY year DESC
+    """, (user_id, user_id))
     rows = cur.fetchall()
     conn.close()
-    if not rows:
-        await message.answer("История матчей пуста.")
+
+    years = [r[0] for r in rows if r and r[0]]
+    if not years:
+        await message.answer("История матчей пуста.", reply_markup=commander_menu)
         return
-    text_lines = []
-    for mid, t1, t2, d, tm, res in rows:
-        conn, cur = conn_cursor()
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        n1 = cur.fetchone()[0] if cur.fetchone() is None else None  # fix below
-        conn.close()
-    # Simplify safe retrieval
+
+    # строим inline-кнопки для годов + кнопку назад
+    inline = InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    for y in years:
+        buttons.append(InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}"))
+    # добавить кнопку назад (возврат в меню)
+    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
+    inline.add(*buttons)
+
+    await message.answer("Выберите год:", reply_markup=inline)
+    await state.set_state(HistoryStates.choosing_year)
+
+@dp.callback_query(F.data.startswith("hist_year:"))
+async def history_year_chosen(cb: types.CallbackQuery, state: FSMContext):
+    year = cb.data.split(":", 1)[1]
+    user_id = cb.from_user.id
+
+    # сохраняем выбор года
+    await state.update_data(year=year)
+
+    # получаем месяцы, в которых есть матчи этого пользователя и этого года
     conn, cur = conn_cursor()
-    text_lines = []
-    for mid, t1, t2, d, tm, res in rows:
+    cur.execute("""
+        SELECT DISTINCT strftime('%m', date) as month
+        FROM matches
+        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
+        ORDER BY month
+    """, (user_id, user_id, year))
+    rows = cur.fetchall()
+    conn.close()
+
+    months = [r[0] for r in rows if r and r[0]]
+    if not months:
+        await cb.message.answer("Нет матчей в этом году.", reply_markup=commander_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    inline = InlineKeyboardMarkup(row_width=3)
+    buttons = []
+    for m in months:
+        # показываем месяц как число; можно преобразовать в имя месяца при желании
+        buttons.append(InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}"))
+    # кнопка назад вернёт к выбору года
+    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:year"))
+    inline.add(*buttons)
+
+    await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
+    await cb.answer()
+    await state.set_state(HistoryStates.choosing_month)
+
+@dp.callback_query(F.data.startswith("hist_month:"))
+async def history_month_chosen(cb: types.CallbackQuery, state: FSMContext):
+    month = cb.data.split(":", 1)[1]
+    user_id = cb.from_user.id
+
+    # сохраняем месяц
+    await state.update_data(month=month)
+    data = await state.get_data()
+    year = data.get("year")
+
+    conn, cur = conn_cursor()
+    cur.execute("""
+        SELECT DISTINCT strftime('%d', date) as day
+        FROM matches
+        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+          AND strftime('%Y', date)=? AND strftime('%m', date)=?
+        ORDER BY day
+    """, (user_id, user_id, year, month))
+    rows = cur.fetchall()
+    conn.close()
+
+    days = [r[0] for r in rows if r and r[0]]
+    if not days:
+        await cb.message.answer("Нет матчей в этом месяце.", reply_markup=commander_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    inline = InlineKeyboardMarkup(row_width=4)
+    buttons = []
+    for d in days:
+        buttons.append(InlineKeyboardButton(text=d, callback_data=f"hist_day:{d}"))
+    # кнопка назад вернёт к выбору года (чтобы выбрать другой месяц/year)
+    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:month"))
+    inline.add(*buttons)
+
+    await cb.message.answer(f"Выбран {year}-{month}. Выберите день:", reply_markup=inline)
+    await cb.answer()
+    await state.set_state(HistoryStates.choosing_day)
+
+@dp.callback_query(F.data.startswith("hist_day:"))
+async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
+    day = cb.data.split(":", 1)[1]
+    data = await state.get_data()
+    year = data.get("year")
+    month = data.get("month")
+    user_id = cb.from_user.id
+
+    # Формируем корректную ISO-дату yyyy-mm-dd (обеспечиваем нули)
+    y = year
+    m = month.zfill(2)
+    d = day.zfill(2)
+    date_iso = f"{y}-{m}-{d}"
+
+    conn, cur = conn_cursor()
+    cur.execute("""
+        SELECT id, team1_id, team2_id, time, result
+        FROM matches
+        WHERE date=? AND (team1_id=? OR team2_id=?)
+        ORDER BY time
+    """, (date_iso, user_id, user_id))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await cb.message.answer(f"Матчей за {date_iso} не найдено.", reply_markup=commander_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    lines = []
+    for mid, t1, t2, tm, res in rows:
+        conn, cur = conn_cursor()
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
         r1 = cur.fetchone()
         name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
         r2 = cur.fetchone()
-        name2 = r2[0] if r2 and r2[0] else f"ID {t2}"
-        text_lines.append(f"ID {mid}: {d} {tm} — {name1} vs {name2} | {res}")
-    conn.close()
-    await message.answer("📚 История (сыгранные матчи):\n" + "\n".join(text_lines))
+        name2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
+        conn.close()
+        lines.append(f"ID {mid}: {tm} — {name1} vs {name2} | {res or 'результат не задан'}")
+
+    await cb.message.answer(f"📚 История матчей за {date_iso}:\n" + "\n".join(lines), reply_markup=commander_menu)
+    await cb.answer()
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("hist_back:"))
+async def history_back(cb: types.CallbackQuery, state: FSMContext):
+    """
+    Обработка кнопки назад: возможные значения:
+    hist_back:menu  -> возврат в меню командира
+    hist_back:year  -> вернуться к списку годов
+    hist_back:month -> вернуться к списку месяцев (для текущего года)
+    """
+    payload = cb.data.split(":", 1)[1]
+    user_id = cb.from_user.id
+
+    if payload == "menu":
+        await cb.message.answer("Возврат в меню командира:", reply_markup=commander_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    if payload == "year":
+        # показать годы снова
+        conn, cur = conn_cursor()
+        cur.execute("""
+            SELECT DISTINCT strftime('%Y', date) as year
+            FROM matches
+            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+            ORDER BY year DESC
+        """, (user_id, user_id))
+        rows = cur.fetchall()
+        conn.close()
+        years = [r[0] for r in rows if r and r[0]]
+        if not years:
+            await cb.message.answer("История пуста.", reply_markup=commander_menu)
+            await cb.answer()
+            await state.clear()
+            return
+        inline = InlineKeyboardMarkup(row_width=2)
+        buttons = [InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}") for y in years]
+        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
+        inline.add(*buttons)
+        await cb.message.answer("Выберите год:", reply_markup=inline)
+        await cb.answer()
+        await state.set_state(HistoryStates.choosing_year)
+        return
+
+    if payload == "month":
+        data = await state.get_data()
+        year = data.get("year")
+        if not year:
+            await cb.message.answer("Ошибка: год не выбран.", reply_markup=commander_menu)
+            await cb.answer()
+            await state.clear()
+            return
+        conn, cur = conn_cursor()
+        cur.execute("""
+            SELECT DISTINCT strftime('%m', date) as month
+            FROM matches
+            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
+            ORDER BY month
+        """, (user_id, user_id, year))
+        rows = cur.fetchall()
+        conn.close()
+        months = [r[0] for r in rows if r and r[0]]
+        if not months:
+            await cb.message.answer("Нет матчей в этом году.", reply_markup=commander_menu)
+            await cb.answer()
+            await state.clear()
+            return
+        inline = InlineKeyboardMarkup(row_width=3)
+        buttons = [InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}") for m in months]
+        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:year"))
+        inline.add(*buttons)
+        await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
+        await cb.answer()
+        await state.set_state(HistoryStates.choosing_month)
+        return
+
+    # По умолчанию просто закрываем
+    await cb.answer()
 
 # ---- Судья: посмотреть все матчи (для судей) ----
 @dp.message(F.text == "📜 Все матчи")
