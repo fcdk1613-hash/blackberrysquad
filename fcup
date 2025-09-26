@@ -47,7 +47,7 @@ GROUP_CHAT_ID: Optional[int] = None  # например -1001234567890 или No
 DB_PATH = "tournament.db"
 
 # Список админов — указываешь вручную ID пользователей (целые числа)
-ADMIN_IDS: List[int] = []  # например [123456789, 987654321]
+ADMIN_IDS: List[int] = [403704696, 1806167653]  # например [123456789, 987654321]
 
 # Список серверов
 SERVER_LIST = ["Server 1", "Server 2", "Server 3", "Server 4"]
