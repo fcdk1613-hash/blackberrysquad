@@ -9,19 +9,18 @@
 - защита от дублей (одной команде нельзя иметь два матча в одно время)
 - при совпадении заявок создаётся матч; обе команды получают уведомления
 - судьи: регистрируются по телефону, видят список назначенных матчей без результата, могут выбрать матч и ввести результат,
-  могут удалять матчи
-- результаты по дате, просмотр всех матчей (судья), просмотр своих матчей (командир)
+  могут удалять матчи (при удалении — удаляются заявки команд на это время)
+- история матчей: командиры видят историю своих команд; судьи видят историю всех команд (год->месяц->день)
+- автоматическое распределение серверов (Server 1..4) — в одно и то же время сервер занимает не более 1 матча
 - кнопки возврата (Назад) в основных диалогах
 - DB: sqlite tournament.db
-- Автоматическое назначение сервера (Server 1..Server 4). Сервер не может быть занят более чем одним матчем на одно и то же время.
-- При удалении матча судьёй удаляются также заявки команд на это время.
 """
 
 import asyncio
 import logging
 import sqlite3
-from datetime import date, datetime, timedelta
-from typing import Optional, Tuple, List
+from datetime import date, timedelta
+from typing import Optional, List
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -72,7 +71,7 @@ def init_db():
         )
     """)
 
-    # назначенные матчи (добавлено поле server)
+    # назначенные матчи (с полем server)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +126,6 @@ class JudgeStates(StatesGroup):
 class DeleteStates(StatesGroup):
     choosing_delete_match = State()
 
-# --- New: history FSM states (год -> месяц -> день)
 class HistoryStates(StatesGroup):
     choosing_year = State()
     choosing_month = State()
@@ -228,7 +226,7 @@ commander_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# изменено: у судей теперь История матчей по год->месяц->день
+# У судей убрана старая кнопка "📊 Результаты за дату", добавлена "📚 История матчей"
 judge_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Внести результат"), KeyboardButton(text="📜 Все матчи")],
@@ -505,16 +503,22 @@ async def my_matches(message: types.Message):
     conn.close()
     await message.answer("📜 Ваши матчи:\n" + "\n".join(text_lines))
 
-# ---- REPLACED: История матчей (пошаговый выбор: год -> месяц -> день) ----
+# ---- История матчей для командиров (год -> месяц -> день) ----
 @dp.message(F.text == "📚 История матчей")
 async def history_start(message: types.Message, state: FSMContext):
     """
-    Шаг 1: показать список годов, в которых у команды есть сыгранные матчи (result IS NOT NULL).
-    Кнопка '🔙 Назад' возвращает в меню.
+    Для командиров показывает историю только их команды (результаты).
+    Для судей этот же хэндлер также запустит судейский путь (см ниже).
     """
     user_id = message.from_user.id
+
+    if is_judge(user_id):
+        # пусть сработает другой поток (см judge_history_start ниже)
+        await judge_history_start(message, state)
+        return
+
+    # командирская логика:
     conn, cur = conn_cursor()
-    # выбираем годы только для матчей этой команды, где есть результат
     cur.execute("""
         SELECT DISTINCT strftime('%Y', date) as year
         FROM matches
@@ -529,12 +533,10 @@ async def history_start(message: types.Message, state: FSMContext):
         await message.answer("История матчей пуста.", reply_markup=commander_menu)
         return
 
-    # строим inline-кнопки для годов + кнопку назад
     inline = InlineKeyboardMarkup(row_width=2)
     buttons = []
     for y in years:
         buttons.append(InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}"))
-    # добавить кнопку назад (возврат в меню)
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
     inline.add(*buttons)
 
@@ -546,10 +548,8 @@ async def history_year_chosen(cb: types.CallbackQuery, state: FSMContext):
     year = cb.data.split(":", 1)[1]
     user_id = cb.from_user.id
 
-    # сохраняем выбор года
     await state.update_data(year=year)
 
-    # получаем месяцы, в которых есть матчи этого пользователя и этого года
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT DISTINCT strftime('%m', date) as month
@@ -568,11 +568,7 @@ async def history_year_chosen(cb: types.CallbackQuery, state: FSMContext):
         return
 
     inline = InlineKeyboardMarkup(row_width=3)
-    buttons = []
-    for m in months:
-        # показываем месяц как число; можно преобразовать в имя месяца при желании
-        buttons.append(InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}"))
-    # кнопка назад вернёт к выбору года
+    buttons = [InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}") for m in months]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:year"))
     inline.add(*buttons)
 
@@ -585,7 +581,6 @@ async def history_month_chosen(cb: types.CallbackQuery, state: FSMContext):
     month = cb.data.split(":", 1)[1]
     user_id = cb.from_user.id
 
-    # сохраняем месяц
     await state.update_data(month=month)
     data = await state.get_data()
     year = data.get("year")
@@ -609,10 +604,7 @@ async def history_month_chosen(cb: types.CallbackQuery, state: FSMContext):
         return
 
     inline = InlineKeyboardMarkup(row_width=4)
-    buttons = []
-    for d in days:
-        buttons.append(InlineKeyboardButton(text=d, callback_data=f"hist_day:{d}"))
-    # кнопка назад вернёт к выбору года (чтобы выбрать другой месяц/year)
+    buttons = [InlineKeyboardButton(text=d, callback_data=f"hist_day:{d}") for d in days]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:month"))
     inline.add(*buttons)
 
@@ -628,7 +620,6 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
     month = data.get("month")
     user_id = cb.from_user.id
 
-    # Формируем корректную ISO-дату yyyy-mm-dd (обеспечиваем нули)
     y = year
     m = month.zfill(2)
     d = day.zfill(2)
@@ -669,12 +660,6 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("hist_back:"))
 async def history_back(cb: types.CallbackQuery, state: FSMContext):
-    """
-    Обработка кнопки назад: возможные значения:
-    hist_back:menu  -> возврат в меню командира
-    hist_back:year  -> вернуться к списку годов
-    hist_back:month -> вернуться к списку месяцев (для текущего года)
-    """
     payload = cb.data.split(":", 1)[1]
     user_id = cb.from_user.id
 
@@ -685,7 +670,6 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         return
 
     if payload == "year":
-        # показать годы снова
         conn, cur = conn_cursor()
         cur.execute("""
             SELECT DISTINCT strftime('%Y', date) as year
@@ -742,7 +726,6 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         await state.set_state(HistoryStates.choosing_month)
         return
 
-    # По умолчанию просто закрываем
     await cb.answer()
 
 # ---- Судья: посмотреть все матчи (для судей) ----
@@ -916,12 +899,8 @@ async def judge_confirm_delete(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer()
 
-# ---- Результаты за дату (все пользователи могут смотреть) ----
-# Удалён/замещён — теперь у судей есть история матчей (год->месяц->день).
-# Оставляем этот обработчик закомментированным/не используемым, чтобы ничего не ломать.
-#@dp.message(F.text == "📊 Результаты за дату")
-#async def results_date_choose(message: types.Message):
-#    ...
+# ---- Результаты/старый хэндлер "результаты за дату" удалён (устарел) ----
+# (оставлен закомментированным в коде — не используется)
 
 # --------------- Обработка кнопки "🔙 Назад" ---------------
 @dp.message(F.text == "🔙 Назад")
@@ -935,68 +914,35 @@ async def back_to_menu(message: types.Message, state: FSMContext):
         await message.answer("Возврат в главное меню:", reply_markup=role_kb)
     await state.clear()
 
-# --- New: судейская история матчей (год -> месяц -> день), показывает ВСЕ матчи за дату ---
-@dp.message(F.text == "📚 История матчей")
+# --- Судейская история матчей (год -> месяц -> день): показывает ВСЕ матчи (результаты) ---
 async def judge_history_start(message: types.Message, state: FSMContext):
-    # Этот обработчик срабатывает для командиров и судей; отличаем по роли
     user_id = message.from_user.id
-    if is_judge(user_id):
-        # Пошаговый выбор для судей: годы из БД (в которых есть матчи с результатом)
-        conn, cur = conn_cursor()
-        cur.execute("""
-            SELECT DISTINCT strftime('%Y', date) as year
-            FROM matches
-            WHERE result IS NOT NULL
-            ORDER BY year DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        years = [r[0] for r in rows if r and r[0]]
-        if not years:
-            await message.answer("История матчей пуста.", reply_markup=judge_menu)
-            return
-        inline = InlineKeyboardMarkup(row_width=3)
-        buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
-        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
-        inline.add(*buttons)
-        await message.answer("Выберите год (судья):", reply_markup=inline)
-        await state.set_state(HistoryStates.choosing_year)
-    else:
-        # командир — существующая логика (выбор по своей команде)
-        conn, cur = conn_cursor()
-        # выбираем годы только для матчей этой команды, где есть результат
-        cur.execute("""
-            SELECT DISTINCT strftime('%Y', date) as year
-            FROM matches
-            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
-            ORDER BY year DESC
-        """, (user_id, user_id))
-        rows = cur.fetchall()
-        conn.close()
-
-        years = [r[0] for r in rows if r and r[0]]
-        if not years:
-            await message.answer("История матчей пуста.", reply_markup=commander_menu)
-            return
-
-        # строим inline-кнопки для годов + кнопку назад
-        inline = InlineKeyboardMarkup(row_width=2)
-        buttons = []
-        for y in years:
-            buttons.append(InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}"))
-        # добавить кнопку назад (возврат в меню)
-        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
-        inline.add(*buttons)
-
-        await message.answer("Выберите год:", reply_markup=inline)
-        await state.set_state(HistoryStates.choosing_year)
+    # Пошаговый выбор для судей: годы, месяцы, дни — по всем матчам с результатами
+    conn, cur = conn_cursor()
+    cur.execute("""
+        SELECT DISTINCT strftime('%Y', date) as year
+        FROM matches
+        WHERE result IS NOT NULL
+        ORDER BY year DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    years = [r[0] for r in rows if r and r[0]]
+    if not years:
+        await message.answer("История матчей пуста.", reply_markup=judge_menu)
+        return
+    inline = InlineKeyboardMarkup(row_width=3)
+    buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
+    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
+    inline.add(*buttons)
+    await message.answer("Выберите год (судья):", reply_markup=inline)
+    await state.set_state(HistoryStates.choosing_year)
 
 @dp.callback_query(F.data.startswith("jhist_year:"))
 async def jhist_year_chosen(cb: types.CallbackQuery, state: FSMContext):
     year = cb.data.split(":", 1)[1]
     await state.update_data(j_year=year)
 
-    # show months available in that year (based on matches with results)
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT DISTINCT strftime('%m', date) as month
@@ -1027,7 +973,6 @@ async def jhist_month_chosen(cb: types.CallbackQuery, state: FSMContext):
     await state.update_data(j_month=month)
     data = await state.get_data()
     year = data.get("j_year")
-    # get days in that month where results exist
     conn, cur = conn_cursor()
     cur.execute("""
          SELECT DISTINCT strftime('%d', date) as day
@@ -1111,7 +1056,6 @@ async def jhist_back(cb: types.CallbackQuery, state: FSMContext):
         await state.clear()
         return
     if payload == "year":
-        # show years again
         conn, cur = conn_cursor()
         cur.execute("""
             SELECT DISTINCT strftime('%Y', date) as year
@@ -1135,7 +1079,6 @@ async def jhist_back(cb: types.CallbackQuery, state: FSMContext):
         await cb.answer()
         await state.set_state(HistoryStates.choosing_year)
         return
-    # default
     await cb.answer()
 
 # --------------- Запуск ---------------
