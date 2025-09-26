@@ -160,6 +160,26 @@ init_db()
 ensure_columns()
 ensure_users_approved_column()
 
+# --- Таблица подтверждений времени между двумя командами (если у них несколько общих слотов) ---
+def ensure_pending_confirmations_table():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_confirmations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            times_csv TEXT,
+            choice_team1 TEXT,
+            choice_team2 TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+ensure_pending_confirmations_table()
+
 # --------------- FSM ---------------
 class RegStates(StatesGroup):
     choosing_role = State()
@@ -429,16 +449,28 @@ async def slot_back(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.set_state(ScheduleStates.choosing_date)
 
+
 @dp.callback_query(F.data.startswith("slot_time:"))
 async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
     """
-    Когда соперник найден: создаём pending_match, присваиваем свободный сервер,
-    отправляем обеим командам выбор карты. Только после выбора обеих карт —
-    матч переносится в matches.
+    Обновлённый алгоритм: при добавлении заявки собираем пересечения по датам.
+    - если найден кандидат с единственным общим временем -> создаём pending_match сразу (как раньше)
+    - если найден кандидат с несколькими общими временами -> создаём запись в pending_confirmations и просим обе команды выбрать одно время
     """
     payload = cb.data.split(":", 1)[1]
     date_iso, time_val = payload.split("|", 1)
     user_id = cb.from_user.id
+
+    # проверка роли и названия команды
+    if not is_commander(user_id):
+        await cb.message.answer("Только одобренные командиры могут назначать игры. Сначала зарегистрируйтесь и дождитесь одобрения администратора.")
+        await cb.answer()
+        return
+    tname = user_team_name(user_id)
+    if not tname:
+        await cb.message.answer("Сначала введите название команды (через /start).")
+        await cb.answer()
+        return
 
     # проверка: у этой команды уже есть назначенный матч в этот слот?
     if has_match(user_id, date_iso, time_val):
@@ -447,8 +479,8 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    # проверка: есть ли уже заявка этой команды на этот слот
     conn, cur = conn_cursor()
+    # проверка: есть ли уже заявка этой команды на этот точный слот
     cur.execute("SELECT id FROM match_requests WHERE team_id=? AND date=? AND time=?", (user_id, date_iso, time_val))
     if cur.fetchone():
         conn.close()
@@ -457,116 +489,148 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    # добавляем заявку
+    # добавляем заявку текущей команды
     cur.execute("INSERT INTO match_requests (team_id, date, time) VALUES (?, ?, ?)", (user_id, date_iso, time_val))
     conn.commit()
 
-    # ищем соперника: берём заявку другой команды на тот же слот, исключая те, у кого уже match
-    cur.execute("SELECT id, team_id FROM match_requests WHERE date=? AND time=? AND team_id!=?", (date_iso, time_val, user_id))
-    candidates = cur.fetchall()
-    opponent_req = None
-    for row in candidates:
-        req_id, candidate_team_id = row
-        if has_match(candidate_team_id, date_iso, time_val):
+    # получаем все заявки других команд на ту же дату
+    cur.execute("SELECT team_id, time FROM match_requests WHERE date=? AND team_id!=?", (date_iso, user_id))
+    other_rows = cur.fetchall()
+
+    # собираем множества времён у других команд
+    others_times = {}
+    for tid, t in other_rows:
+        others_times.setdefault(tid, set()).add(t)
+
+    # текущее множество времен команды user_id на выбранную дату (включая только что добавленный слот)
+    cur.execute("SELECT time FROM match_requests WHERE date=? AND team_id=?", (date_iso, user_id))
+    my_times = set([r[0] for r in cur.fetchall()])
+
+    # смотрим кандидатов
+    matched = False
+    for candidate_id, times_set in others_times.items():
+        common = sorted(list(my_times.intersection(times_set)))
+        if not common:
             continue
-        opponent_req = (req_id, candidate_team_id)
-        break
 
-    if opponent_req:
-        req_id, opp_team_id = opponent_req
+        # если общий слот ровно один — создаём pending_match и просим выбрать карту
+        if len(common) == 1:
+            chosen_time = common[0]
+            # проверка свободного сервера
+            free_server = pick_free_server(date_iso, chosen_time)
+            if not free_server:
+                # уведомляем обе команды, заявки остаются
+                cur.execute("SELECT team_name FROM users WHERE user_id=?", (candidate_id,))
+                t1 = cur.fetchone(); t1_name = t1[0] if t1 and t1[0] else f"ID {candidate_id}"
+                cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
+                t2 = cur.fetchone(); t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
+                text = f"⚠️ На {date_iso} {chosen_time} все сервера заняты. Матч между {t1_name} и {t2_name} пока не назначен — заявки сохранены."
+                await send_safe(candidate_id, text)
+                await send_safe(user_id, text)
+                if GROUP_CHAT_ID:
+                    try:
+                        await bot.send_message(GROUP_CHAT_ID, f"Попытка назначить матч {t1_name} vs {t2_name} на {date_iso} {chosen_time}, но все сервера заняты.")
+                    except Exception:
+                        pass
+                conn.close()
+                await cb.answer()
+                await state.clear()
+                return
 
-        # Проверяем свободный сервер на этот слот
-        free_server = pick_free_server(date_iso, time_val)
-        if not free_server:
-            # Все сервера заняты — не создаём матч, уведомляем обе команды. Заявки остаются.
-            cur.execute("SELECT team_name FROM users WHERE user_id=?", (opp_team_id,))
-            t1 = cur.fetchone()
-            t1_name = t1[0] if t1 and t1[0] else f"ID {opp_team_id}"
+            # Создаём pending_match
+            cur.execute(
+                "INSERT INTO pending_matches (team1_id, team2_id, date, time, server, map_choice_team1, map_choice_team2) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                (candidate_id, user_id, date_iso, chosen_time, free_server)
+            )
+            pending_id = cur.lastrowid
+            conn.commit()
+
+            # удаляем соответствующие заявки на этот слот (если есть)
+            cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (candidate_id, date_iso, chosen_time))
+            cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (user_id, date_iso, chosen_time))
+            conn.commit()
+
+            # формируем клавиатуру выбора карт
+            def make_map_kb(pending_id):
+                rows = []
+                row = []
+                for i, m in enumerate(MAP_LIST, 1):
+                    row.append(InlineKeyboardButton(text=m, callback_data=f"map_pick:{pending_id}:{m}"))
+                    if i % 3 == 0:
+                        rows.append(row)
+                        row = []
+                if row:
+                    rows.append(row)
+                return InlineKeyboardMarkup(inline_keyboard=rows)
+
+            kb = make_map_kb(pending_id)
+
+            # уведомляем обе команды
+            cur.execute("SELECT team_name FROM users WHERE user_id=?", (candidate_id,))
+            t1 = cur.fetchone(); t1_name = t1[0] if t1 and t1[0] else f"ID {candidate_id}"
             cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
-            t2 = cur.fetchone()
-            t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
+            t2 = cur.fetchone(); t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
 
-            text = f"⚠️ На {date_iso} {time_val} все сервера заняты. Матч между {t1_name} и {t2_name} пока не назначен — заявки сохранены (ожидаем свободного сервера)."
-            await send_safe(opp_team_id, text)
-            await send_safe(user_id, text)
+            text_msg = (f"🔔 Найден соперник!\nМатч: {t1_name} vs {t2_name}\n📅 {date_iso} ⏰ {chosen_time}\n🌐 Сервер: {free_server}\n\nПожалуйста, выберите карту:")
+            await send_safe(candidate_id, text_msg)
+            await send_safe(user_id, text_msg)
+            try:
+                await bot.send_message(candidate_id, "Выберите карту для матча:", reply_markup=kb)
+            except Exception:
+                logger.info("Не удалось отправить выбор карты команде %s", candidate_id)
+            try:
+                await bot.send_message(user_id, "Выберите карту для матча:", reply_markup=kb)
+            except Exception:
+                logger.info("Не удалось отправить выбор карты команде %s", user_id)
+
             if GROUP_CHAT_ID:
                 try:
-                    await bot.send_message(GROUP_CHAT_ID, f"Попытка назначить матч {t1_name} vs {t2_name} на {date_iso} {time_val}, но все сервера заняты.")
-                except Exception as e:
-                    logger.info("Не удалось отправить сообщение в GROUP_CHAT_ID: %s", e)
-            conn.close()
-            await cb.message.answer("К сожалению, на этот слот все сервера заняты — ваша заявка сохранена и ждёт свободного сервера.")
-            await cb.answer()
-            await state.clear()
-            return
+                    await bot.send_message(GROUP_CHAT_ID, f"Матч ожидает выбора карт: {t1_name} vs {t2_name} — {date_iso} {chosen_time} — Сервер: {free_server}")
+                except Exception:
+                    pass
 
-        # Создаём pending_match (team1 = opp_team_id — тот, кто был в заявке раньше)
-        cur.execute(
-            "INSERT INTO pending_matches (team1_id, team2_id, date, time, server, map_choice_team1, map_choice_team2) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
-            (opp_team_id, user_id, date_iso, time_val, free_server)
-        )
-        pending_id = cur.lastrowid
-        conn.commit()
+            matched = True
+            break
 
-        # уведомляем обе команды: просим выбрать карту (инлайн)
-        def make_map_kb(pending_id):
-            rows = []
-            row = []
-            for i, m in enumerate(MAP_LIST, 1):
-                row.append(InlineKeyboardButton(text=m, callback_data=f"map_pick:{pending_id}:{m}"))
-                if i % 3 == 0:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
-            return InlineKeyboardMarkup(inline_keyboard=rows)
+        # если есть несколько общих слотов -> создаём pending_confirmations и просим подтвердить время
+        if len(common) > 1:
+            times_csv = ",".join(common)
+            cur.execute("INSERT INTO pending_confirmations (team1_id, team2_id, date, times_csv, choice_team1, choice_team2) VALUES (?, ?, ?, ?, NULL, NULL)",
+                        (candidate_id, user_id, date_iso, times_csv))
+            pc_id = cur.lastrowid
+            conn.commit()
 
-        kb = make_map_kb(pending_id)
+            # кнопки для выбора времени
+            buttons = [[InlineKeyboardButton(text=t, callback_data=f"confirm_time:{pc_id}:{t}")] for t in common]
+            buttons.append([InlineKeyboardButton(text="❌ Отказаться", callback_data=f"confirm_time:{pc_id}:CANCEL")])
+            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-        # Получаем имена команд для текста
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (opp_team_id,))
-        t1 = cur.fetchone()
-        t1_name = t1[0] if t1 and t1[0] else f"ID {opp_team_id}"
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
-        t2 = cur.fetchone()
-        t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
+            cur.execute("SELECT team_name FROM users WHERE user_id=?", (candidate_id,))
+            t1 = cur.fetchone(); t1_name = t1[0] if t1 and t1[0] else f"ID {candidate_id}"
+            cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
+            t2 = cur.fetchone(); t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
 
-        text1 = (f"🔔 Найден соперник для вашей заявки!\n"
-                 f"Матч: {t1_name} vs {t2_name}\n"
-                 f"📅 {date_iso} ⏰ {time_val}\n"
-                 f"🌐 Сервер: {free_server}\n\n"
-                 f"Пожалуйста, выберите карту (ваш выбор будет учтён при выборе итоговой карты):")
-        text2 = text1  # одинаковый текст для обеих сторон
-
-        # send to both
-        await send_safe(opp_team_id, text1)
-        await send_safe(user_id, text2)
-        # send inline keyboards to both via direct messages (so they tap)
-        try:
-            await bot.send_message(opp_team_id, "Выберите карту для матча:", reply_markup=kb)
-        except Exception:
-            logger.info("Не удалось отправить выбор карты команде %s", opp_team_id)
-        try:
-            await bot.send_message(user_id, "Выберите карту для матча:", reply_markup=kb)
-        except Exception:
-            logger.info("Не удалось отправить выбор карты команде %s", user_id)
-
-        # групповой уведом — что матч ожидает выбора карт
-        if GROUP_CHAT_ID:
+            txt = (f"🔔 Найден соперник: {t1_name} vs {t2_name}\n"
+                   f"📅 {date_iso}\n"
+                   f"У вас общие времена: {', '.join(common)}\n"
+                   f"Пожалуйста, выберите одно из них (оба должны выбрать одинаковый слот):")
+            await send_safe(candidate_id, txt)
+            await send_safe(user_id, txt)
             try:
-                await bot.send_message(GROUP_CHAT_ID, f"Матч ожидает выбора карт: {t1_name} vs {t2_name} — {date_iso} {time_val} — Сервер: {free_server}")
-            except Exception as e:
-                logger.info("Не удалось отправить сообщение в GROUP_CHAT_ID: %s", e)
+                await bot.send_message(candidate_id, "Выберите время:", reply_markup=kb)
+            except Exception:
+                logger.info("Не удалось отправить кнопку выбора времени команде %s", candidate_id)
+            try:
+                await bot.send_message(user_id, "Выберите время:", reply_markup=kb)
+            except Exception:
+                logger.info("Не удалось отправить кнопку выбора времени команде %s", user_id)
 
-        await cb.message.answer("Соперник найден — ожидаем выбора карт обеими командами. После выбора карта будет определена и матч назначен.")
-        await cb.answer()
-        conn.close()
-        await state.clear()
-        return
+            matched = True
+            break
 
-    # если соперника нет — оставляем заявку и ждём
     conn.close()
-    await cb.message.answer(f"✅ Ваша заявка сохранена на {date_iso} {time_val}. Ожидаем соперника.")
+    if not matched:
+        await cb.message.answer(f"✅ Ваша заявка сохранена на {date_iso} {time_val}. Ожидаем соперника.")
     await cb.answer()
     await state.clear()
 
