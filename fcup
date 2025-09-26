@@ -7,18 +7,21 @@
 - командиры: регистрация команды, назначение матчей (выбор даты из ближайших 7 дней, время 19:00/20:00/21:00),
   просмотр своих заявок, расписания, истории матчей
 - защита от дублей (одной команде нельзя иметь два матча в одно время)
-- при совпадении заявок создаётся матч; обе команды получают уведомления
+- при совпадении заявок создаётся матч; до записи в matches — согласование карт (каждая команда выбирает карту),
+  бот случайно выбирает одну из двух выбранных карт и только потом матч фиксируется
 - судьи: регистрируются по телефону, видят список назначенных матчей без результата, могут выбрать матч и ввести результат,
   могут удалять матчи (при удалении — удаляются заявки команд на это время)
-- история матчей: командиры видят историю своих команд; судьи видят историю всех команд (год->месяц->день)
+- история матчей: командиры видят историю только своей команды; судьи видят историю всех команд (год->месяц->день)
 - автоматическое распределение серверов (Server 1..4) — в одно и то же время сервер занимает не более 1 матча
 - кнопки возврата (Назад) в основных диалогах
 - DB: sqlite tournament.db
+- карты: Narva, Mutaha, Harju, Fallujah, BlackCoast, Sanxian
 """
 
 import asyncio
 import logging
 import sqlite3
+import random
 from datetime import date, timedelta
 from typing import Optional, List
 
@@ -42,6 +45,9 @@ DB_PATH = "tournament.db"
 
 # Список серверов
 SERVER_LIST = ["Server 1", "Server 2", "Server 3", "Server 4"]
+
+# Список карт
+MAP_LIST = ["Narva", "Mutaha", "Harju", "Fallujah", "BlackCoast", "Sanxian"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,7 +77,7 @@ def init_db():
         )
     """)
 
-    # назначенные матчи (с полем server)
+    # назначенные матчи (с полем server и map если есть)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,17 +87,31 @@ def init_db():
             time TEXT,
             result TEXT,
             judge_id INTEGER,
-            server TEXT
+            server TEXT,
+            map TEXT
+        )
+    """)
+
+    # временные pending матчи до согласования карты
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            server TEXT,
+            map_choice_team1 TEXT,
+            map_choice_team2 TEXT
         )
     """)
 
     conn.commit()
     conn.close()
 
-def ensure_server_column():
+def ensure_columns():
     """
-    На случай, если таблица matches была создана ранее без поля server,
-    проверяем и добавляем колонку server, если ее нет.
+    Проверки/дополнение колонок на случай апгрейда БД (server, map).
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -104,10 +124,17 @@ def ensure_server_column():
             logger.info("Добавлена колонка server в matches")
         except Exception as e:
             logger.warning("Не удалось добавить колонку server: %s", e)
+    if "map" not in cols:
+        try:
+            cur.execute("ALTER TABLE matches ADD COLUMN map TEXT")
+            conn.commit()
+            logger.info("Добавлена колонка map в matches")
+        except Exception as e:
+            logger.warning("Не удалось добавить колонку map: %s", e)
     conn.close()
 
 init_db()
-ensure_server_column()
+ensure_columns()
 
 # --------------- FSM ---------------
 class RegStates(StatesGroup):
@@ -130,6 +157,9 @@ class HistoryStates(StatesGroup):
     choosing_year = State()
     choosing_month = State()
     choosing_day = State()
+
+class MapStates(StatesGroup):
+    waiting_for_map_choice = State()
 
 # --------------- Бот и диспетчер ---------------
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -226,7 +256,7 @@ commander_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# У судей убрана старая кнопка "📊 Результаты за дату", добавлена "📚 История матчей"
+# У судей: заменили "результаты за дату" на "История матчей"
 judge_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Внести результат"), KeyboardButton(text="📜 Все матчи")],
@@ -306,7 +336,7 @@ async def got_team_name(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Команда <b>{team_name}</b> зарегистрирована!", reply_markup=commander_menu)
     await state.clear()
 
-# ---- Назначение матча: дата -> время -> сохранение заявки/матча ----
+# ---- Назначение матча: дата -> время -> сохранение заявки/ожидание соперника и карт ----
 @dp.message(F.text == "📅 Назначить игру")
 async def start_schedule(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -353,12 +383,16 @@ async def slot_back(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("slot_time:"))
 async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
+    """
+    Когда соперник найден: создаём pending_match, присваиваем свободный сервер,
+    отправляем обеим командам выбор карты. Только после выбора обеих карт —
+    матч переносится в matches.
+    """
     payload = cb.data.split(":", 1)[1]
     date_iso, time_val = payload.split("|", 1)
     user_id = cb.from_user.id
 
     # проверка: у этой команды уже есть назначенный матч в этот слот?
-    # (исключаем возможность иметь >1 матч в одно время)
     if has_match(user_id, date_iso, time_val):
         await cb.message.answer("❌ У вашей команды уже назначен матч в этот день/время.")
         await cb.answer()
@@ -379,14 +413,12 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
     cur.execute("INSERT INTO match_requests (team_id, date, time) VALUES (?, ?, ?)", (user_id, date_iso, time_val))
     conn.commit()
 
-    # ищем соперника: берём заявку другой команды на тот же слот, но при этом
-    # исключаем команды, у которых уже есть назначенный матч в это время (в таблице matches)
+    # ищем соперника: берём заявку другой команды на тот же слот, исключая те, у кого уже match
     cur.execute("SELECT id, team_id FROM match_requests WHERE date=? AND time=? AND team_id!=?", (date_iso, time_val, user_id))
     candidates = cur.fetchall()
     opponent_req = None
     for row in candidates:
         req_id, candidate_team_id = row
-        # если у кандидата уже есть match в matches таблице на этот слот — пропускаем
         if has_match(candidate_team_id, date_iso, time_val):
             continue
         opponent_req = (req_id, candidate_team_id)
@@ -420,16 +452,32 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
             await state.clear()
             return
 
-        # создаём матч: team1 = opp_team_id (тот, кто был раньше), team2 = user_id, server = free_server
-        cur.execute("INSERT INTO matches (team1_id, team2_id, date, time, server) VALUES (?, ?, ?, ?, ?)",
-                    (opp_team_id, user_id, date_iso, time_val, free_server))
-        match_id = cur.lastrowid
-        # удаляем заявки обеих команд
-        cur.execute("DELETE FROM match_requests WHERE id=?", (req_id,))
-        cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (user_id, date_iso, time_val))
+        # Создаём pending_match (team1 = opp_team_id — тот, кто был в заявке раньше)
+        cur.execute(
+            "INSERT INTO pending_matches (team1_id, team2_id, date, time, server, map_choice_team1, map_choice_team2) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+            (opp_team_id, user_id, date_iso, time_val, free_server)
+        )
+        pending_id = cur.lastrowid
         conn.commit()
 
-        # уведомляем обе команды
+        # уведомляем обе команды: просим выбрать карту (инлайн)
+        def make_map_kb(pending_id):
+            rows = []
+            # Create rows with up to 3 buttons per row for readability
+            row = []
+            for i, m in enumerate(MAP_LIST, 1):
+                row.append(InlineKeyboardButton(text=m, callback_data=f"map_pick:{pending_id}:{m}"))
+                if i % 3 == 0:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+            # add cancel/back? not needed here; they must choose
+            return InlineKeyboardMarkup(inline_keyboard=rows)
+
+        kb = make_map_kb(pending_id)
+
+        # Получаем имена команд для текста
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (opp_team_id,))
         t1 = cur.fetchone()
         t1_name = t1[0] if t1 and t1[0] else f"ID {opp_team_id}"
@@ -437,22 +485,40 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
         t2 = cur.fetchone()
         t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
 
-        text = (f"⚔️ <b>Назначен матч</b>!\n"
-                f"ID {match_id}\n"
-                f"📅 {date_iso} ⏰ {time_val}\n"
-                f"🏆 {t1_name} vs {t2_name}\n"
-                f"🌐 Сервер: {free_server}")
-        # ЛС обеим командам (параллельно)
-        await send_safe(opp_team_id, text)
-        await send_safe(user_id, text)
-        # оповещение в общий чат, если задан
+        text1 = (f"🔔 Найден соперник для вашей заявки!\n"
+                 f"Матч: {t1_name} vs {t2_name}\n"
+                 f"📅 {date_iso} ⏰ {time_val}\n"
+                 f"🌐 Сервер: {free_server}\n\n"
+                 f"Пожалуйста, выберите карту (ваш выбор будет учтён при выборе итоговой карты):")
+        text2 = (f"🔔 Найден соперник для вашей заявки!\n"
+                 f"Матч: {t1_name} vs {t2_name}\n"
+                 f"📅 {date_iso} ⏰ {time_val}\n"
+                 f"🌐 Сервер: {free_server}\n\n"
+                 f"Пожалуйста, выберите карту (ваш выбор будет учтён при выборе итоговой карты):")
+
+        # send to both
+        await send_safe(opp_team_id, text1)
+        await send_safe(user_id, text2)
+        # send inline keyboards to both via direct messages (so they tap)
+        try:
+            await bot.send_message(opp_team_id, "Выберите карту для матча:", reply_markup=kb)
+        except Exception:
+            logger.info("Не удалось отправить выбор карты команде %s", opp_team_id)
+        try:
+            await bot.send_message(user_id, "Выберите карту для матча:", reply_markup=kb)
+        except Exception:
+            logger.info("Не удалось отправить выбор карты команде %s", user_id)
+
+        # групповой уведом — что матч ожидает выбора карт
         if GROUP_CHAT_ID:
             try:
-                await bot.send_message(GROUP_CHAT_ID, text)
+                await bot.send_message(GROUP_CHAT_ID, f"Матч ожидает выбора карт: {t1_name} vs {t2_name} — {date_iso} {time_val} — Сервер: {free_server}")
             except Exception as e:
                 logger.info("Не удалось отправить сообщение в GROUP_CHAT_ID: %s", e)
 
-        await cb.message.answer(f"Матч назначен: {t1_name} vs {t2_name} (ID {match_id}). Сервер: {free_server}")
+        # удаляем заявки? нет — пусть заявки существуют until match confirmed; but we remove them after match is confirmed (we already planned to delete them when finalizing)
+        # Для ясности заявки можно временно оставить — при финальном создании матчей мы удалим заявки.
+        await cb.message.answer("Соперник найден — ожидаем выбора карт обеими командами. После выбора карта будет определена и матч назначен.")
         await cb.answer()
         conn.close()
         await state.clear()
@@ -463,6 +529,109 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer(f"✅ Ваша заявка сохранена на {date_iso} {time_val}. Ожидаем соперника.")
     await cb.answer()
     await state.clear()
+
+# ---- Обработка выбора карты (callback) ----
+@dp.callback_query(F.data.startswith("map_pick:"))
+async def on_map_pick(cb: types.CallbackQuery):
+    """
+    Callback data: map_pick:{pending_id}:{map_name}
+    Определяем, кто нажал (team1 или team2) и сохраняем выбор.
+    Если оба выбрали — случайно выбираем итоговую карту из двух вариантов, создаём запись в matches,
+    удаляем pending_matches, удаляем заявки обеих команд и уведомляем команды/группу.
+    """
+    try:
+        _, payload = cb.data.split(":", 1)
+        pending_id_str, map_choice = payload.split(":", 1)
+        pending_id = int(pending_id_str)
+    except Exception:
+        await cb.answer("Неверный callback.")
+        return
+
+    user_id = cb.from_user.id
+    conn, cur = conn_cursor()
+    cur.execute("SELECT team1_id, team2_id, date, time, server, map_choice_team1, map_choice_team2 FROM pending_matches WHERE id=?", (pending_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        await cb.answer("Этот матч уже обработан или не найден.")
+        return
+
+    team1_id, team2_id, date_iso, time_val, server, m1, m2 = row
+
+    # проверим, что нажатие делает именно командир одной из учавствующих команд
+    if user_id != team1_id and user_id != team2_id:
+        conn.close()
+        await cb.answer("Вы не участвуете в этом матче.")
+        return
+
+    # сохраняем выбор
+    if user_id == team1_id:
+        cur.execute("UPDATE pending_matches SET map_choice_team1=? WHERE id=?", (map_choice, pending_id))
+        conn.commit()
+        await cb.answer(f"Вы выбрали карту: {map_choice}")
+    else:
+        cur.execute("UPDATE pending_matches SET map_choice_team2=? WHERE id=?", (map_choice, pending_id))
+        conn.commit()
+        await cb.answer(f"Вы выбрали карту: {map_choice}")
+
+    # проверяем, выбрала ли вторая команда
+    cur.execute("SELECT map_choice_team1, map_choice_team2 FROM pending_matches WHERE id=?", (pending_id,))
+    row2 = cur.fetchone()
+    if not row2:
+        conn.close()
+        return
+    choice1, choice2 = row2
+
+    # если оба выбора есть — финализируем матч
+    if choice1 and choice2:
+        # выбрать итоговую карту случайно из двух выбранных
+        final_map = random.choice([choice1, choice2])
+        # создаём запись в matches
+        cur.execute("INSERT INTO matches (team1_id, team2_id, date, time, server, map) VALUES (?, ?, ?, ?, ?, ?)",
+                    (team1_id, team2_id, date_iso, time_val, server, final_map))
+        match_id = cur.lastrowid
+        # удаляем pending
+        cur.execute("DELETE FROM pending_matches WHERE id=?", (pending_id,))
+        # удаляем заявки обеих команд на этот слот (если остались)
+        try:
+            cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (team1_id, date_iso, time_val))
+            cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (team2_id, date_iso, time_val))
+        except Exception:
+            logger.exception("Ошибка при удалении заявок при финализации матча.")
+        conn.commit()
+
+        # уведомляем команды
+        cur.execute("SELECT team_name FROM users WHERE user_id=?", (team1_id,))
+        r1 = cur.fetchone()
+        n1 = r1[0] if r1 and r1[0] else f"ID {team1_id}"
+        cur.execute("SELECT team_name FROM users WHERE user_id=?", (team2_id,))
+        r2 = cur.fetchone()
+        n2 = r2[0] if r2 and r2[0] else f"ID {team2_id}"
+
+        text = (f"⚔️ <b>Матч назначен</b>!\n"
+                f"ID {match_id}\n"
+                f"📅 {date_iso} ⏰ {time_val}\n"
+                f"🏆 {n1} vs {n2}\n"
+                f"🌐 Сервер: {server}\n"
+                f"🗺 Карта: {final_map}")
+        # отправляем ЛС обеим командам
+        await send_safe(team1_id, text)
+        await send_safe(team2_id, text)
+        # отправляем в group chat, если задан
+        if GROUP_CHAT_ID:
+            try:
+                await bot.send_message(GROUP_CHAT_ID, text)
+            except Exception:
+                pass
+
+        await cb.message.answer(f"Матч окончательно назначен: {n1} vs {n2} (ID {match_id}). Карта: {final_map}", reply_markup=ReplyKeyboardRemove())
+        conn.close()
+        return
+
+    conn.close()
+    # если второй ещё не выбрал — просто подтверждение уже дано
+    await cb.message.answer("Ваш выбор принят. Ожидаем выбор соперника.")
+    return
 
 # ---- Просмотр заявок / расписания / матчи для командиров ----
 @dp.message(F.text == "📖 Мое расписание")
@@ -482,7 +651,7 @@ async def my_requests(message: types.Message):
 async def my_matches(message: types.Message):
     user_id = message.from_user.id
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server FROM matches WHERE team1_id=? OR team2_id=?", (user_id, user_id))
+    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server, map FROM matches WHERE team1_id=? OR team2_id=?", (user_id, user_id))
     rows = cur.fetchall()
     conn.close()
     if not rows:
@@ -491,7 +660,7 @@ async def my_matches(message: types.Message):
     # Формируем вывод
     text_lines = []
     conn, cur = conn_cursor()
-    for mid, t1, t2, d, tm, res, srv in rows:
+    for mid, t1, t2, d, tm, res, srv, mp in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
         r1 = cur.fetchone()
         n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
@@ -499,7 +668,8 @@ async def my_matches(message: types.Message):
         r2 = cur.fetchone()
         n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
         srv_text = f" | Сервер: {srv}" if srv else ""
-        text_lines.append(f"ID {mid}: {d} {tm} — {n1} vs {n2}{srv_text} | {res or 'результат не задан'}")
+        map_text = f" | Карта: {mp}" if mp else ""
+        text_lines.append(f"ID {mid}: {d} {tm} — {n1} vs {n2}{srv_text}{map_text} | {res or 'результат не задан'}")
     conn.close()
     await message.answer("📜 Ваши матчи:\n" + "\n".join(text_lines))
 
@@ -508,12 +678,12 @@ async def my_matches(message: types.Message):
 async def history_start(message: types.Message, state: FSMContext):
     """
     Для командиров показывает историю только их команды (результаты).
-    Для судей этот же хэндлер также запустит судейский путь (см ниже).
+    Для судей этот же хэндлер также запустит судейский путь (см judge_history_start).
     """
     user_id = message.from_user.id
 
     if is_judge(user_id):
-        # пусть сработает другой поток (см judge_history_start ниже)
+        # запустить судейский путь
         await judge_history_start(message, state)
         return
 
@@ -627,7 +797,7 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
 
     conn, cur = conn_cursor()
     cur.execute("""
-        SELECT id, team1_id, team2_id, time, result, server
+        SELECT id, team1_id, team2_id, time, result, server, map
         FROM matches
         WHERE date=? AND (team1_id=? OR team2_id=?)
         ORDER BY time
@@ -642,7 +812,7 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
         return
 
     lines = []
-    for mid, t1, t2, tm, res, srv in rows:
+    for mid, t1, t2, tm, res, srv, mp in rows:
         conn, cur = conn_cursor()
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
         r1 = cur.fetchone()
@@ -652,7 +822,8 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
         name2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
         conn.close()
         srv_text = f" | Сервер: {srv}" if srv else ""
-        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text} | {res or 'результат не задан'}")
+        map_text = f" | Карта: {mp}" if mp else ""
+        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text}{map_text} | {res or 'результат не задан'}")
 
     await cb.message.answer(f"📚 История матчей за {date_iso}:\n" + "\n".join(lines), reply_markup=commander_menu)
     await cb.answer()
@@ -736,7 +907,7 @@ async def all_matches(message: types.Message):
         await message.answer("Только для судей.")
         return
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server FROM matches ORDER BY date, time")
+    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server, map FROM matches ORDER BY date, time")
     rows = cur.fetchall()
     conn.close()
     if not rows:
@@ -744,7 +915,7 @@ async def all_matches(message: types.Message):
         return
     text_lines = []
     conn, cur = conn_cursor()
-    for mid, t1, t2, d, tm, res, srv in rows:
+    for mid, t1, t2, d, tm, res, srv, mp in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
         r1 = cur.fetchone()
         name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
@@ -752,7 +923,8 @@ async def all_matches(message: types.Message):
         r2 = cur.fetchone()
         name2 = r2[0] if r2 and r2[0] else f"ID {t2}"
         srv_text = f" | Сервер: {srv}" if srv else ""
-        text_lines.append(f"ID {mid}: {d} {tm}{srv_text} — {name1} vs {name2} | {res or 'результат не задан'}")
+        map_text = f" | Карта: {mp}" if mp else ""
+        text_lines.append(f"ID {mid}: {d} {tm}{srv_text}{map_text} — {name1} vs {name2} | {res or 'результат не задан'}")
     conn.close()
     await message.answer("📜 Все матчи:\n" + "\n".join(text_lines))
 
@@ -899,9 +1071,6 @@ async def judge_confirm_delete(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer()
 
-# ---- Результаты/старый хэндлер "результаты за дату" удалён (устарел) ----
-# (оставлен закомментированным в коде — не используется)
-
 # --------------- Обработка кнопки "🔙 Назад" ---------------
 @dp.message(F.text == "🔙 Назад")
 async def back_to_menu(message: types.Message, state: FSMContext):
@@ -1016,7 +1185,7 @@ async def jhist_day_chosen(cb: types.CallbackQuery, state: FSMContext):
 
     conn, cur = conn_cursor()
     cur.execute("""
-        SELECT id, team1_id, team2_id, time, result, server
+        SELECT id, team1_id, team2_id, time, result, server, map
         FROM matches
         WHERE date=? AND result IS NOT NULL
         ORDER BY time
@@ -1032,7 +1201,7 @@ async def jhist_day_chosen(cb: types.CallbackQuery, state: FSMContext):
 
     lines = []
     conn, cur = conn_cursor()
-    for mid, t1, t2, tm, res, srv in rows:
+    for mid, t1, t2, tm, res, srv, mp in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
         r1 = cur.fetchone()
         name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
@@ -1040,7 +1209,8 @@ async def jhist_day_chosen(cb: types.CallbackQuery, state: FSMContext):
         r2 = cur.fetchone()
         name2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
         srv_text = f" | Сервер: {srv}" if srv else ""
-        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text} | {res}")
+        map_text = f" | Карта: {mp}" if mp else ""
+        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text}{map_text} | {res}")
     conn.close()
 
     await cb.message.answer(f"📚 История матчей (все команды) за {date_iso}:\n" + "\n".join(lines), reply_markup=judge_menu)
