@@ -13,6 +13,7 @@
 - результаты по дате, просмотр всех матчей (судья), просмотр своих матчей (командир)
 - кнопки возврата (Назад) в основных диалогах
 - DB: sqlite tournament.db
+- Автоматическое назначение сервера (Server 1..Server 4). Сервер не может быть занят более чем одним матчем на одно и то же время.
 """
 
 import asyncio
@@ -39,6 +40,9 @@ GROUP_CHAT_ID: Optional[int] = None  # например -1001234567890 или No
 
 DB_PATH = "tournament.db"
 
+# Список серверов
+SERVER_LIST = ["Server 1", "Server 2", "Server 3", "Server 4"]
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -52,7 +56,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             phone TEXT,
-            role TEXT,           -- 'commander' или 'judge'
+            role TEXT,
             team_name TEXT
         )
     """)
@@ -67,7 +71,7 @@ def init_db():
         )
     """)
 
-    # назначенные матчи
+    # назначенные матчи (добавлено поле server)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,14 +80,34 @@ def init_db():
             date TEXT,
             time TEXT,
             result TEXT,
-            judge_id INTEGER
+            judge_id INTEGER,
+            server TEXT
         )
     """)
 
     conn.commit()
     conn.close()
 
+def ensure_server_column():
+    """
+    На случай, если таблица matches была создана ранее без поля server,
+    проверяем и добавляем колонку server, если ее нет.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(matches)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "server" not in cols:
+        try:
+            cur.execute("ALTER TABLE matches ADD COLUMN server TEXT")
+            conn.commit()
+            logger.info("Добавлена колонка server в matches")
+        except Exception as e:
+            logger.warning("Не удалось добавить колонку server: %s", e)
+    conn.close()
+
 init_db()
+ensure_server_column()
 
 # --------------- FSM ---------------
 class RegStates(StatesGroup):
@@ -113,6 +137,7 @@ bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
 # --------------- Утилиты ---------------
+
 def conn_cursor():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     cur = conn.cursor()
@@ -166,6 +191,20 @@ def remove_request(team_id: int, date_iso: str, time_val: str):
     conn.commit()
     conn.close()
 
+def get_used_servers(date_iso: str, time_val: str) -> List[str]:
+    conn, cur = conn_cursor()
+    cur.execute("SELECT server FROM matches WHERE date=? AND time=? AND server IS NOT NULL", (date_iso, time_val))
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows if r and r[0]]
+
+def pick_free_server(date_iso: str, time_val: str) -> Optional[str]:
+    used = set(get_used_servers(date_iso, time_val))
+    for s in SERVER_LIST:
+        if s not in used:
+            return s
+    return None
+
 # --------------- Клавиатуры ---------------
 role_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -188,10 +227,11 @@ commander_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# изменено: у судей теперь История матчей по год->месяц->день
 judge_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Внести результат"), KeyboardButton(text="📜 Все матчи")],
-        [KeyboardButton(text="📊 Результаты за дату"), KeyboardButton(text="🗑 Удалить матч")]
+        [KeyboardButton(text="📚 История матчей"), KeyboardButton(text="🗑 Удалить матч")]
     ],
     resize_keyboard=True
 )
@@ -355,9 +395,35 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
 
     if opponent_req:
         req_id, opp_team_id = opponent_req
-        # создаём матч: team1 = opp_team_id (тот, кто был раньше), team2 = user_id
-        cur.execute("INSERT INTO matches (team1_id, team2_id, date, time) VALUES (?, ?, ?, ?)",
-                    (opp_team_id, user_id, date_iso, time_val))
+
+        # Проверяем свободный сервер на этот слот
+        free_server = pick_free_server(date_iso, time_val)
+        if not free_server:
+            # Все сервера заняты — не создаём матч, уведомляем обе команды. Заявки остаются.
+            cur.execute("SELECT team_name FROM users WHERE user_id=?", (opp_team_id,))
+            t1 = cur.fetchone()
+            t1_name = t1[0] if t1 and t1[0] else f"ID {opp_team_id}"
+            cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
+            t2 = cur.fetchone()
+            t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
+
+            text = f"⚠️ На {date_iso} {time_val} все сервера заняты. Матч между {t1_name} и {t2_name} пока не назначен — заявки сохранены (ожидаем свободного сервера)."
+            await send_safe(opp_team_id, text)
+            await send_safe(user_id, text)
+            if GROUP_CHAT_ID:
+                try:
+                    await bot.send_message(GROUP_CHAT_ID, f"Попытка назначить матч {t1_name} vs {t2_name} на {date_iso} {time_val}, но все сервера заняты.")
+                except Exception as e:
+                    logger.info("Не удалось отправить сообщение в GROUP_CHAT_ID: %s", e)
+            conn.close()
+            await cb.message.answer("К сожалению, на этот слот все сервера заняты — ваша заявка сохранена и ждёт свободного сервера.")
+            await cb.answer()
+            await state.clear()
+            return
+
+        # создаём матч: team1 = opp_team_id (тот, кто был раньше), team2 = user_id, server = free_server
+        cur.execute("INSERT INTO matches (team1_id, team2_id, date, time, server) VALUES (?, ?, ?, ?, ?)",
+                    (opp_team_id, user_id, date_iso, time_val, free_server))
         match_id = cur.lastrowid
         # удаляем заявки обеих команд
         cur.execute("DELETE FROM match_requests WHERE id=?", (req_id,))
@@ -372,7 +438,11 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
         t2 = cur.fetchone()
         t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
 
-        text = f"⚔️ <b>Назначен матч</b>!\nID {match_id}\n📅 {date_iso} ⏰ {time_val}\n🏆 {t1_name} vs {t2_name}"
+        text = (f"⚔️ <b>Назначен матч</b>!\n"
+                f"ID {match_id}\n"
+                f"📅 {date_iso} ⏰ {time_val}\n"
+                f"🏆 {t1_name} vs {t2_name}\n"
+                f"🌐 Сервер: {free_server}")
         # ЛС обеим командам (параллельно)
         await send_safe(opp_team_id, text)
         await send_safe(user_id, text)
@@ -383,7 +453,7 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
             except Exception as e:
                 logger.info("Не удалось отправить сообщение в GROUP_CHAT_ID: %s", e)
 
-        await cb.message.answer(f"Матч назначен: {t1_name} vs {t2_name} (ID {match_id})")
+        await cb.message.answer(f"Матч назначен: {t1_name} vs {t2_name} (ID {match_id}). Сервер: {free_server}")
         await cb.answer()
         conn.close()
         await state.clear()
@@ -413,30 +483,24 @@ async def my_requests(message: types.Message):
 async def my_matches(message: types.Message):
     user_id = message.from_user.id
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time, result FROM matches WHERE team1_id=? OR team2_id=?", (user_id, user_id))
+    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server FROM matches WHERE team1_id=? OR team2_id=?", (user_id, user_id))
     rows = cur.fetchall()
     conn.close()
     if not rows:
         await message.answer("У вашей команды пока нет назначенных матчей.")
         return
-    lines = []
-    for mid, t1, t2, d, tm, res in rows:
-        conn, cur = conn_cursor()
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        tn1 = cur.fetchone()[0] if cur.fetchone() is None else cur.fetchone()[0]  # safe fallback
-        # The above double fetch is intentionally conservative; fix to simple:
-        conn.close()
-    # We'll produce with simple fetch logic to avoid double fetch issue:
-    conn, cur = conn_cursor()
+    # Формируем вывод
     text_lines = []
-    for mid, t1, t2, d, tm, res in rows:
+    conn, cur = conn_cursor()
+    for mid, t1, t2, d, tm, res, srv in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        n1_row = cur.fetchone()
-        n1 = n1_row[0] if n1_row and n1_row[0] else f"ID {t1}"
+        r1 = cur.fetchone()
+        n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        n2_row = cur.fetchone()
-        n2 = n2_row[0] if n2_row and n2_row[0] else f"ID {t2}"
-        text_lines.append(f"ID {mid}: {d} {tm} — {n1} vs {n2} | {res or 'результат не задан'}")
+        r2 = cur.fetchone()
+        n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
+        srv_text = f" | Сервер: {srv}" if srv else ""
+        text_lines.append(f"ID {mid}: {d} {tm} — {n1} vs {n2}{srv_text} | {res or 'результат не задан'}")
     conn.close()
     await message.answer("📜 Ваши матчи:\n" + "\n".join(text_lines))
 
@@ -571,7 +635,7 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
 
     conn, cur = conn_cursor()
     cur.execute("""
-        SELECT id, team1_id, team2_id, time, result
+        SELECT id, team1_id, team2_id, time, result, server
         FROM matches
         WHERE date=? AND (team1_id=? OR team2_id=?)
         ORDER BY time
@@ -586,7 +650,7 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
         return
 
     lines = []
-    for mid, t1, t2, tm, res in rows:
+    for mid, t1, t2, tm, res, srv in rows:
         conn, cur = conn_cursor()
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
         r1 = cur.fetchone()
@@ -595,7 +659,8 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
         r2 = cur.fetchone()
         name2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
         conn.close()
-        lines.append(f"ID {mid}: {tm} — {name1} vs {name2} | {res or 'результат не задан'}")
+        srv_text = f" | Сервер: {srv}" if srv else ""
+        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text} | {res or 'результат не задан'}")
 
     await cb.message.answer(f"📚 История матчей за {date_iso}:\n" + "\n".join(lines), reply_markup=commander_menu)
     await cb.answer()
@@ -687,7 +752,7 @@ async def all_matches(message: types.Message):
         await message.answer("Только для судей.")
         return
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time, result FROM matches ORDER BY date, time")
+    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server FROM matches ORDER BY date, time")
     rows = cur.fetchall()
     conn.close()
     if not rows:
@@ -695,14 +760,15 @@ async def all_matches(message: types.Message):
         return
     text_lines = []
     conn, cur = conn_cursor()
-    for mid, t1, t2, d, tm, res in rows:
+    for mid, t1, t2, d, tm, res, srv in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
         r1 = cur.fetchone()
         name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
         r2 = cur.fetchone()
         name2 = r2[0] if r2 and r2[0] else f"ID {t2}"
-        text_lines.append(f"ID {mid}: {d} {tm} — {name1} vs {name2} | {res or 'результат не задан'}")
+        srv_text = f" | Сервер: {srv}" if srv else ""
+        text_lines.append(f"ID {mid}: {d} {tm}{srv_text} — {name1} vs {name2} | {res or 'результат не задан'}")
     conn.close()
     await message.answer("📜 Все матчи:\n" + "\n".join(text_lines))
 
@@ -844,40 +910,11 @@ async def judge_confirm_delete(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
 
 # ---- Результаты за дату (все пользователи могут смотреть) ----
-@dp.message(F.text == "📊 Результаты за дату")
-async def results_date_choose(message: types.Message):
-    # показываем последние 7 дней выбора (можно изменить политику)
-    today = date.today()
-    days = [(today - timedelta(days=i)).isoformat() for i in range(7)]
-    inline = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=d, callback_data=f"res_date:{d}")] for d in days
-    ])
-    await message.answer("Выберите дату:", reply_markup=inline)
-
-@dp.callback_query(F.data.startswith("res_date:"))
-async def show_results_for_date(cb: types.CallbackQuery):
-    d = cb.data.split(":", 1)[1]
-    conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, time, result FROM matches WHERE date=?", (d,))
-    rows = cur.fetchall()
-    conn.close()
-    if not rows:
-        await cb.message.answer("Нет матчей за эту дату.")
-        await cb.answer()
-        return
-    lines = []
-    conn, cur = conn_cursor()
-    for mid, t1, t2, tm, res in rows:
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        r1 = cur.fetchone()
-        n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        r2 = cur.fetchone()
-        n2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
-        lines.append(f"ID {mid}: {tm} — {n1} vs {n2} | {res or 'результат не задан'}")
-    conn.close()
-    await cb.message.answer(f"Результаты за {d}:\n" + "\n".join(lines))
-    await cb.answer()
+# Удалён/замещён — теперь у судей есть история матчей (год->месяц->день).
+# Оставляем этот обработчик закомментированным/не используемым, чтобы ничего не ломать.
+#@dp.message(F.text == "📊 Результаты за дату")
+#async def results_date_choose(message: types.Message):
+#    ...
 
 # --------------- Обработка кнопки "🔙 Назад" ---------------
 @dp.message(F.text == "🔙 Назад")
@@ -890,6 +927,209 @@ async def back_to_menu(message: types.Message, state: FSMContext):
     else:
         await message.answer("Возврат в главное меню:", reply_markup=role_kb)
     await state.clear()
+
+# --- New: судейская история матчей (год -> месяц -> день), показывает ВСЕ матчи за дату ---
+@dp.message(F.text == "📚 История матчей")
+async def judge_history_start(message: types.Message, state: FSMContext):
+    # Этот обработчик срабатывает для командиров и судей; отличаем по роли
+    user_id = message.from_user.id
+    if is_judge(user_id):
+        # Пошаговый выбор для судей: годы из БД (в которых есть матчи с результатом)
+        conn, cur = conn_cursor()
+        cur.execute("""
+            SELECT DISTINCT strftime('%Y', date) as year
+            FROM matches
+            WHERE result IS NOT NULL
+            ORDER BY year DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        years = [r[0] for r in rows if r and r[0]]
+        if not years:
+            await message.answer("История матчей пуста.", reply_markup=judge_menu)
+            return
+        inline = InlineKeyboardMarkup(row_width=3)
+        buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
+        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
+        inline.add(*buttons)
+        await message.answer("Выберите год (судья):", reply_markup=inline)
+        await state.set_state(HistoryStates.choosing_year)
+    else:
+        # командир — существующая логика (выбор по своей команде)
+        conn, cur = conn_cursor()
+        # выбираем годы только для матчей этой команды, где есть результат
+        cur.execute("""
+            SELECT DISTINCT strftime('%Y', date) as year
+            FROM matches
+            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+            ORDER BY year DESC
+        """, (user_id, user_id))
+        rows = cur.fetchall()
+        conn.close()
+
+        years = [r[0] for r in rows if r and r[0]]
+        if not years:
+            await message.answer("История матчей пуста.", reply_markup=commander_menu)
+            return
+
+        # строим inline-кнопки для годов + кнопку назад
+        inline = InlineKeyboardMarkup(row_width=2)
+        buttons = []
+        for y in years:
+            buttons.append(InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}"))
+        # добавить кнопку назад (возврат в меню)
+        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
+        inline.add(*buttons)
+
+        await message.answer("Выберите год:", reply_markup=inline)
+        await state.set_state(HistoryStates.choosing_year)
+
+@dp.callback_query(F.data.startswith("jhist_year:"))
+async def jhist_year_chosen(cb: types.CallbackQuery, state: FSMContext):
+    year = cb.data.split(":", 1)[1]
+    await state.update_data(j_year=year)
+
+    # show months available in that year (based on matches with results)
+    conn, cur = conn_cursor()
+    cur.execute("""
+        SELECT DISTINCT strftime('%m', date) as month
+        FROM matches
+        WHERE result IS NOT NULL AND strftime('%Y', date)=?
+        ORDER BY month
+    """, (year,))
+    rows = cur.fetchall()
+    conn.close()
+    months = [r[0] for r in rows if r and r[0]]
+    if not months:
+        await cb.message.answer("Нет матчей в этом году.", reply_markup=judge_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    inline = InlineKeyboardMarkup(row_width=4)
+    buttons = [InlineKeyboardButton(text=m, callback_data=f"jhist_month:{m}") for m in months]
+    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
+    inline.add(*buttons)
+    await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
+    await cb.answer()
+    await state.set_state(HistoryStates.choosing_month)
+
+@dp.callback_query(F.data.startswith("jhist_month:"))
+async def jhist_month_chosen(cb: types.CallbackQuery, state: FSMContext):
+    month = cb.data.split(":", 1)[1]
+    await state.update_data(j_month=month)
+    data = await state.get_data()
+    year = data.get("j_year")
+    # get days in that month where results exist
+    conn, cur = conn_cursor()
+    cur.execute("""
+         SELECT DISTINCT strftime('%d', date) as day
+         FROM matches
+         WHERE result IS NOT NULL AND strftime('%Y', date)=? AND strftime('%m', date)=?
+         ORDER BY day
+    """, (year, month))
+    rows = cur.fetchall()
+    conn.close()
+    days = [r[0] for r in rows if r and r[0]]
+    if not days:
+        await cb.message.answer("Нет матчей в этом месяце.", reply_markup=judge_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    inline = InlineKeyboardMarkup(row_width=6)
+    buttons = [InlineKeyboardButton(text=d, callback_data=f"jhist_day:{d}") for d in days]
+    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:year"))
+    inline.add(*buttons)
+    await cb.message.answer(f"Выбран {year}-{month}. Выберите день:", reply_markup=inline)
+    await cb.answer()
+    await state.set_state(HistoryStates.choosing_day)
+
+@dp.callback_query(F.data.startswith("jhist_day:"))
+async def jhist_day_chosen(cb: types.CallbackQuery, state: FSMContext):
+    day = cb.data.split(":", 1)[1]
+    data = await state.get_data()
+    year = data.get("j_year")
+    month = data.get("j_month")
+    if not (year and month):
+        await cb.message.answer("Ошибка: год или месяц не выбраны.", reply_markup=judge_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    y = str(year)
+    m = month.zfill(2)
+    d = day.zfill(2)
+    date_iso = f"{y}-{m}-{d}"
+
+    conn, cur = conn_cursor()
+    cur.execute("""
+        SELECT id, team1_id, team2_id, time, result, server
+        FROM matches
+        WHERE date=? AND result IS NOT NULL
+        ORDER BY time
+    """, (date_iso,))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await cb.message.answer(f"Нет сыгранных матчей за {date_iso}.", reply_markup=judge_menu)
+        await cb.answer()
+        await state.clear()
+        return
+
+    lines = []
+    conn, cur = conn_cursor()
+    for mid, t1, t2, tm, res, srv in rows:
+        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
+        r1 = cur.fetchone()
+        name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
+        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
+        r2 = cur.fetchone()
+        name2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
+        srv_text = f" | Сервер: {srv}" if srv else ""
+        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text} | {res}")
+    conn.close()
+
+    await cb.message.answer(f"📚 История матчей (все команды) за {date_iso}:\n" + "\n".join(lines), reply_markup=judge_menu)
+    await cb.answer()
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("jhist_back:"))
+async def jhist_back(cb: types.CallbackQuery, state: FSMContext):
+    payload = cb.data.split(":", 1)[1]
+    if payload == "menu":
+        await cb.message.answer("Возврат в меню судьи:", reply_markup=judge_menu)
+        await cb.answer()
+        await state.clear()
+        return
+    if payload == "year":
+        # show years again
+        conn, cur = conn_cursor()
+        cur.execute("""
+            SELECT DISTINCT strftime('%Y', date) as year
+            FROM matches
+            WHERE result IS NOT NULL
+            ORDER BY year DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        years = [r[0] for r in rows if r and r[0]]
+        if not years:
+            await cb.message.answer("История пуста.", reply_markup=judge_menu)
+            await cb.answer()
+            await state.clear()
+            return
+        inline = InlineKeyboardMarkup(row_width=3)
+        buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
+        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
+        inline.add(*buttons)
+        await cb.message.answer("Выберите год (судья):", reply_markup=inline)
+        await cb.answer()
+        await state.set_state(HistoryStates.choosing_year)
+        return
+    # default
+    await cb.answer()
 
 # --------------- Запуск ---------------
 async def main():
