@@ -14,6 +14,7 @@
 - кнопки возврата (Назад) в основных диалогах
 - DB: sqlite tournament.db
 - Автоматическое назначение сервера (Server 1..Server 4). Сервер не может быть занят более чем одним матчем на одно и то же время.
+- При удалении матча судьёй удаляются также заявки команд на это время.
 """
 
 import asyncio
@@ -890,16 +891,22 @@ async def judge_confirm_delete(cb: types.CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     t1, t2, d, tm = row
-    # удаляем
+    # удаляем сам матч
     cur.execute("DELETE FROM matches WHERE id=?", (mid,))
+    # удаляем также заявки обеих команд на эту дату/время (если есть)
+    try:
+        cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (t1, d, tm))
+        cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (t2, d, tm))
+    except Exception as e:
+        logger.info("Ошибка при удалении заявок: %s", e)
     conn.commit()
     conn.close()
 
     # уведомления
-    await cb.message.answer(f"Матч ID {mid} удалён ✅")
-    await send_safe(t1, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}).")
+    await cb.message.answer(f"Матч ID {mid} удалён ✅ (матч и заявки удалены)")
+    await send_safe(t1, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}). Ваши заявки на {d} {tm} также удалены.")
     if t2:
-        await send_safe(t2, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}).")
+        await send_safe(t2, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}). Ваши заявки на {d} {tm} также удалены.")
     if GROUP_CHAT_ID:
         try:
             await bot.send_message(GROUP_CHAT_ID, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}).")
