@@ -50,7 +50,7 @@ DB_PATH = "tournament.db"
 ADMIN_IDS: List[int] = [403704696, 1806167653]  # например [123456789, 987654321]
 
 # Список серверов
-SERVER_LIST = ["Server 1", "Server 2", "Server 3"]
+SERVER_LIST = ["Server 2", "Server 3", "Server 4"]
 
 # Список карт
 MAP_LIST = ["Narva", "Mutaha", "Harju", "Fallujah", "BlackCoast", "Sanxian"]
