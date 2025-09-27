@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Полный рабочий код бота турнира Squad (aiogram 3.x).
-Функционал:
-- регистрация по телефону (командир / судья) с модерацией администратора (approved)
-- командиры: регистрация команды, назначение матчей (выбор даты из ближайших 7 дней, время 19:00/20:00/21:00),
-  просмотр своих заявок, расписания, истории матчей
-- защита от дублей (одной команде нельзя иметь два матча в одно время)
-- при совпадении заявок создаётся матч; до записи в matches — согласование карт (каждая команда выбирает карту),
-  бот случайно выбирает одну из двух выбранных карт и только потом матч фиксируется
-- судьи: регистрируются по телефону, видят список назначенных матчей без результата, могут выбрать матч и ввести результат,
-  могут удалять матчи (при удалении — удаляются заявки команд на это время)
-- история матчей: командиры видят историю только своей команды; судьи видят историю всех команд (год->месяц->день)
-- автоматическое распределение серверов (Server 1..4) — в одно и то же время сервер занимает не более 1 матча
-- кнопки возврата (Назад) в основных диалогах
-- DB: sqlite tournament.db
-- карты: Narva, Mutaha, Harju, Fallujah, BlackCoast, Sanxian
-- администраторы: список ADMIN_IDS (в коде). При регистрации пользователю выставляется approved=0.
-  Админы получают уведомление и могут /accept <user_id> или /decline <user_id>.
-  Также админы могут просматривать список команд/судей и удалять их.
+Полный бот турнира Squad (aiogram 3.x)
+Содержит:
+- регистрация (командир/судья) по контакту (телефон)
+- подтверждение регистрации админами
+- назначение матчей (выбор даты: ближайшие 7 дней; время 19/20/21)
+- автоматический подбор соперника, серверов (Server2..Server4) и карты (рандом)
+- pending_confirmations, если у двух команд несколько общих слотов
+- судьи: вносят результат -> матч перемещается в history
+- судьи: могут удалять матчи
+- история матчей (год->месяц->день)
+- sqlite3 database tournament.db
 """
 
 import asyncio
 import logging
 import sqlite3
 import random
-from datetime import date, timedelta
-from typing import Optional, List
+from datetime import date, timedelta, datetime
+from typing import Optional, List, Tuple
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -40,40 +33,37 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 # ----------------- Настройки -----------------
-API_TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"   # <-- вставь сюда токен (если нужно заменить)
-# Если хочешь, чтобы бот отправлял уведомления в общий чат (группу/канал), укажи ID:
-GROUP_CHAT_ID: Optional[int] = None  # например -1001234567890 или None
-
+API_TOKEN = "PUT_YOUR_TOKEN_HERE"  # <--- вставьте токен сюда
+GROUP_CHAT_ID: Optional[int] = None  # при желании: -1001234567890
 DB_PATH = "tournament.db"
 
-# Список админов — указываешь вручную ID пользователей (целые числа)
-ADMIN_IDS: List[int] = [403704696, 1806167653]  # например [123456789, 987654321]
+# Карты и сервера (исключаем первый сервер)
+MAPS = ["Narva", "Mutaha", "Harju", "Fallujah", "BlackCoast", "Sanxian"]
+SERVERS = ["Server2", "Server3", "Server4"]
 
-# Список серверов
-SERVER_LIST = ["Server 1", "Server 2", "Server 3", "Server 4"]
-
-# Список карт
-MAP_LIST = ["Narva", "Mutaha", "Harju", "Fallujah", "BlackCoast", "Sanxian"]
+# Список админов (вставьте Telegram user_id админов)
+ADMINS = [123456789]  # <-- изменить
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --------------- Инициализация бд -------------
+# ----------------- Инициализация БД -----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # таблица пользователей (командиры и судьи) — может не иметь approved (миграция ниже добавит)
+    # users: user_id, phone, role ('commander'|'judge'), team_name, approved (0/1)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             phone TEXT,
             role TEXT,
-            team_name TEXT
+            team_name TEXT,
+            approved INTEGER DEFAULT 0
         )
     """)
 
-    # заявки команд (ожидают соперника)
+    # match requests (ожидание соперника)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS match_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +73,7 @@ def init_db():
         )
     """)
 
-    # назначенные матчи (с полем server и map если есть)
+    # matches (активные назначенные матчи)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,131 +81,29 @@ def init_db():
             team2_id INTEGER,
             date TEXT,
             time TEXT,
-            result TEXT,
+            server TEXT,
+            map TEXT,
             judge_id INTEGER,
+            result TEXT
+        )
+    """)
+
+    # history (сыгранные матчи)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
             server TEXT,
-            map TEXT
+            map TEXT,
+            judge_id INTEGER,
+            result TEXT
         )
     """)
 
-    # временные pending матчи до согласования карты
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pending_matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            server TEXT,
-            map_choice_team1 TEXT,
-            map_choice_team2 TEXT
-        )
-    """)
-
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-def ensure_columns():
-    """
-    Проверки/дополнение колонок на случай апгрейда БД (server, map).
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(matches)")
-    cols = [r[1] for r in cur.fetchall()]
-    if "server" not in cols:
-        try:
-            cur.execute("ALTER TABLE matches ADD COLUMN server TEXT")
-            # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-            logger.info("Добавлена колонка server в matches")
-        except Exception as e:
-            logger.warning("Не удалось добавить колонку server: %s", e)
-    if "map" not in cols:
-        try:
-            cur.execute("ALTER TABLE matches ADD COLUMN map TEXT")
-            # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-            logger.info("Добавлена колонка map в matches")
-        except Exception as e:
-            logger.warning("Не удалось добавить колонку map: %s", e)
-    conn.close()
-
-def ensure_users_approved_column():
-    """
-    Если в users нет колонки approved, добавим её. По-умолчанию 0 (ожидает одобрения).
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(users)")
-    cols = [r[1] for r in cur.fetchall()]
-    if "approved" not in cols:
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 0")
-            # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-            logger.info("Добавлена колонка approved в users")
-        except Exception as e:
-            logger.warning("Не удалось добавить колонку approved: %s", e)
-    conn.close()
-
-init_db()
-ensure_columns()
-ensure_users_approved_column()
-
-# --- Таблица подтверждений времени между двумя командами (если у них несколько общих слотов) ---
-def ensure_pending_confirmations_table():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    # pending_confirmations: если у двух команд несколько общих слотов -> выбрать одно время
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending_confirmations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,25 +115,13 @@ def ensure_pending_confirmations_table():
             choice_team2 TEXT
         )
     """)
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
 
     conn.commit()
     conn.close()
 
-ensure_pending_confirmations_table()
+init_db()
 
-# --------------- FSM ---------------
+# ----------------- FSM -----------------
 class RegStates(StatesGroup):
     choosing_role = State()
     waiting_for_contact = State()
@@ -255,26 +131,26 @@ class ScheduleStates(StatesGroup):
     choosing_date = State()
     choosing_time = State()
 
+class ConfirmStates(StatesGroup):
+    waiting_confirm = State()
+
 class JudgeStates(StatesGroup):
     choosing_match = State()
     entering_result = State()
 
 class DeleteStates(StatesGroup):
-    choosing_delete_match = State()
+    choosing_delete = State()
 
 class HistoryStates(StatesGroup):
     choosing_year = State()
     choosing_month = State()
     choosing_day = State()
 
-class MapStates(StatesGroup):
-    waiting_for_map_choice = State()
-
-# --------------- Бот и диспетчер ---------------
-bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+# ----------------- Bot & Dispatcher -----------------
+bot = Bot(token=API_TOKEN)  # don't pass parse_mode to constructor in aiogram 3.x
 dp = Dispatcher(storage=MemoryStorage())
 
-# --------------- Утилиты ---------------
+# ----------------- Utilities -----------------
 def conn_cursor():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     cur = conn.cursor()
@@ -284,15 +160,22 @@ def dates_next_week_iso() -> List[str]:
     today = date.today()
     return [(today + timedelta(days=i)).isoformat() for i in range(7)]
 
-async def send_safe(user_id: int, text: str):
+async def send_safe(user_id: int, text: str, **kwargs):
     try:
-        await bot.send_message(user_id, text)
+        await bot.send_message(user_id, text, **kwargs)
     except Exception as e:
-        logger.info("Не удалось отправить личное сообщение %s: %s", user_id, e)
+        logger.info("Не удалось отправить сообщение %s: %s", user_id, e)
 
 def user_team_name(user_id: int) -> Optional[str]:
     conn, cur = conn_cursor()
     cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
+    r = cur.fetchone()
+    conn.close()
+    return r[0] if r and r[0] else None
+
+def get_user_role(user_id: int) -> Optional[str]:
+    conn, cur = conn_cursor()
+    cur.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
     r = cur.fetchone()
     conn.close()
     return r[0] if r and r[0] else None
@@ -311,67 +194,35 @@ def is_judge(user_id: int) -> bool:
     conn.close()
     return bool(r and r[0] == "judge" and r[1] == 1)
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def has_match(team_id: int, date_iso: str, time_val: str) -> bool:
-    """Проверяет, есть ли у команды назначенный матч в этот слот."""
+def has_active_match(team_id: int, date_iso: str, time_val: str) -> bool:
     conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT 1 FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND date=? AND time=?
-    """, (team_id, team_id, date_iso, time_val))
+    cur.execute("SELECT 1 FROM matches WHERE (team1_id=? OR team2_id=?) AND date=? AND time=?", (team_id, team_id, date_iso, time_val))
     r = cur.fetchone()
     conn.close()
     return r is not None
 
-def remove_request(team_id: int, date_iso: str, time_val: str):
-    conn, cur = conn_cursor()
-    cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (team_id, date_iso, time_val))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-def get_used_servers(date_iso: str, time_val: str) -> List[str]:
-    conn, cur = conn_cursor()
-    cur.execute("SELECT server FROM matches WHERE date=? AND time=? AND server IS NOT NULL", (date_iso, time_val))
-    rows = cur.fetchall()
-    conn.close()
-    return [r[0] for r in rows if r and r[0]]
-
 def pick_free_server(date_iso: str, time_val: str) -> Optional[str]:
-    used = set(get_used_servers(date_iso, time_val))
-    for s in SERVER_LIST:
-        if s not in used:
-            return s
-    return None
+    """Return random free server from SERVERS at given date/time or None"""
+    conn, cur = conn_cursor()
+    cur.execute("SELECT server FROM matches WHERE date=? AND time=?", (date_iso, time_val))
+    busy = [row[0] for row in cur.fetchall() if row and row[0]]
+    conn.close()
+    available = [s for s in SERVERS if s not in busy]
+    return random.choice(available) if available else None
 
-# --------------- Клавиатуры ---------------
+def make_map_choice() -> str:
+    return random.choice(MAPS)
+
+# ----------------- Keyboards -----------------
 role_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🛡 Я - командир"), KeyboardButton(text="⚖️ Я - судья")]
-    ],
+    keyboard=[[KeyboardButton(text="🛡 Я - командир"), KeyboardButton(text="⚖️ Я - судья")]],
     resize_keyboard=True
 )
-
 contact_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
     resize_keyboard=True,
     one_time_keyboard=True
 )
-
 commander_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📅 Назначить игру"), KeyboardButton(text="📖 Мое расписание")],
@@ -379,44 +230,42 @@ commander_menu = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
-
-# У судей: заменили "результаты за дату" на "История матчей"
 judge_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Внести результат"), KeyboardButton(text="📜 Все матчи")],
-        [KeyboardButton(text="📚 История матчей"), KeyboardButton(text="🗑 Удалить матч")]
+        [KeyboardButton(text="🗑 Удалить матч"), KeyboardButton(text="📚 История матчей")]
     ],
     resize_keyboard=True
 )
-
 back_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Назад")]], resize_keyboard=True)
 
-# --------------- Хэндлеры ---------------
-
+# ----------------- Handlers -----------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    """/start - показать меню выбора роли или главное меню, если уже зарегистрирован и одобрен"""
     conn, cur = conn_cursor()
     cur.execute("SELECT role, team_name, approved FROM users WHERE user_id=?", (message.from_user.id,))
     r = cur.fetchone()
     conn.close()
-
     if r:
         role, team_name, approved = r
-        if not approved:
-            await message.answer("⏳ Ваша заявка ожидает одобрения администратора. Подождите, пожалуйста.")
-            return
         if role == "commander":
-            await message.answer("Вы авторизованы как командир.", reply_markup=commander_menu)
+            if approved == 1:
+                await message.answer("Вы авторизованы как командир.", reply_markup=commander_menu)
+            else:
+                await message.answer("Ваша регистрация ожидает подтверждения администратора.", reply_markup=ReplyKeyboardRemove())
         elif role == "judge":
-            await message.answer("Вы авторизованы как судья.", reply_markup=judge_menu)
+            if approved == 1:
+                await message.answer("Вы авторизованы как судья.", reply_markup=judge_menu)
+            else:
+                await message.answer("Ваша регистрация судьи ожидает подтверждения администратора.", reply_markup=ReplyKeyboardRemove())
         else:
             await message.answer("Выберите роль:", reply_markup=role_kb)
+            await state.set_state(RegStates.choosing_role)
     else:
         await message.answer("Привет! Пожалуйста, выберите роль:", reply_markup=role_kb)
         await state.set_state(RegStates.choosing_role)
 
-# ---- Регистрация роли и телефон (заявка на approval) ----
+# Registration role
 @dp.message(RegStates.choosing_role, F.text.in_(["🛡 Я - командир", "⚖️ Я - судья"]))
 async def choose_role(message: types.Message, state: FSMContext):
     role = "commander" if message.text == "🛡 Я - командир" else "judge"
@@ -432,41 +281,29 @@ async def got_contact(message: types.Message, state: FSMContext):
     role = data.get("chosen_role")
     user_id = message.from_user.id
 
-    # Вставляем/обновляем запись с approved = 0 (ожидает подтверждения)
     conn, cur = conn_cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO users (user_id, phone, role, team_name, approved)
-        VALUES (?, ?, ?, COALESCE((SELECT team_name FROM users WHERE user_id=?), NULL), 0)
-    """, (user_id, phone, role, user_id))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
+    # вставим или обновим запись; approved=0 (ожидает подтверждения)
+    cur.execute("INSERT OR REPLACE INTO users (user_id, phone, role, team_name, approved) VALUES (?, ?, ?, COALESCE((SELECT team_name FROM users WHERE user_id=?), NULL), COALESCE((SELECT approved FROM users WHERE user_id=?), 0))",
+                (user_id, phone, role, user_id, user_id))
     conn.commit()
     conn.close()
 
+    # если командир — запрашиваем название команды (но команда будет ожидать подтверждения админа)
     if role == "commander":
-        # запросим название команды
-        await message.answer("Отлично — теперь введите название вашей команды (одно сообщение):", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Введите название вашей команды (одно сообщение):", reply_markup=ReplyKeyboardRemove())
         await state.set_state(RegStates.waiting_for_team_name)
     else:
-        # судья зарегистрирован, но ждёт одобрения
-        await message.answer("⏳ Ваша заявка как судьи отправлена на рассмотрение администратору.")
-        # уведомляем админов
-        for aid in ADMIN_IDS:
+        # судья зарегистрирован, но нужно подтверждение админом
+        await message.answer("Регистрация получена. Ожидайте подтверждения администратора.", reply_markup=ReplyKeyboardRemove())
+        # уведомим админов
+        conn, cur = conn_cursor()
+        cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
+        cur.close(); conn.close()
+        for a in ADMINS:
             try:
-                await send_safe(aid, f"🚨 Запрос на регистрацию судьи\nID: {user_id}\nТелефон: {phone}")
+                await bot.send_message(a, f"Новый запрос на регистрацию судьи:\nUserID: {user_id}\nPhone: {phone}\nИспользуйте команду: /accept {user_id} или /decline {user_id}")
             except Exception:
-                logger.info("Не удалось оповестить админа %s о регистрации судьи %s", aid, user_id)
+                pass
         await state.clear()
 
 @dp.message(RegStates.waiting_for_team_name, F.text)
@@ -475,56 +312,88 @@ async def got_team_name(message: types.Message, state: FSMContext):
     if not team_name:
         await message.answer("Название не может быть пустым. Введите ещё раз:")
         return
-
     user_id = message.from_user.id
     conn, cur = conn_cursor()
-    cur.execute("UPDATE users SET team_name=?, approved=0 WHERE user_id=?", (team_name, user_id))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
+    cur.execute("UPDATE users SET team_name=? WHERE user_id=?", (team_name, user_id))
     conn.commit()
-    # получим телефон для уведомления админов
-    cur.execute("SELECT phone FROM users WHERE user_id=?", (user_id,))
-    phone_row = cur.fetchone()
-    phone = phone_row[0] if phone_row and phone_row[0] else "—"
     conn.close()
 
-    await message.answer(f"⏳ Заявка на регистрацию команды <b>{team_name}</b> отправлена администраторам для одобрения.")
-    # уведомляем админов о заявке
-    for aid in ADMIN_IDS:
+    await message.answer(f"Регистрация команды '{team_name}' получена. Ожидайте одобрения администратора.", reply_markup=ReplyKeyboardRemove())
+    # уведомляем админов
+    conn, cur = conn_cursor()
+    cur.execute("SELECT phone FROM users WHERE user_id=?", (user_id,))
+    phone = cur.fetchone()[0] if cur.fetchone() is None else None
+    conn.close()
+    for a in ADMINS:
         try:
-            await send_safe(aid, f"🚨 Запрос на регистрацию команды\nID: {user_id}\nКоманда: {team_name}\nТелефон: {phone}\n\nДля подтверждения используйте: /accept {user_id}\nДля отклонения: /decline {user_id}")
+            await bot.send_message(a, f"Новый запрос на регистрацию команды:\nUserID: {user_id}\nTeam: {team_name}\n\nПринять: /accept {user_id}\nОтклонить: /decline {user_id}")
         except Exception:
-            logger.info("Не удалось оповестить админа %s о регистрации команды %s", aid, team_name)
+            pass
+
     await state.clear()
 
-# ---- Назначение матча: дата -> время -> сохранение заявки/ожидание соперника и карт ----
+# Admin accept/decline
+@dp.message(Command("accept"))
+async def admin_accept(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /accept <user_id>")
+        return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        await message.answer("Неверный user_id")
+        return
+    conn, cur = conn_cursor()
+    cur.execute("UPDATE users SET approved=1 WHERE user_id=?", (uid,))
+    conn.commit()
+    cur.execute("SELECT role, team_name FROM users WHERE user_id=?", (uid,))
+    r = cur.fetchone()
+    conn.close()
+    if r:
+        role, team = r
+        try:
+            await bot.send_message(uid, f"Ваша регистрация подтверждена администратором. Роль: {role}.")
+        except Exception:
+            pass
+        await message.answer(f"Пользователь {uid} одобрен.")
+    else:
+        await message.answer("Пользователь не найден.")
+
+@dp.message(Command("decline"))
+async def admin_decline(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /decline <user_id>")
+        return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        await message.answer("Неверный user_id")
+        return
+    conn, cur = conn_cursor()
+    cur.execute("DELETE FROM users WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+    try:
+        await bot.send_message(uid, "Ваша регистрация отклонена администратором.")
+    except Exception:
+        pass
+    await message.answer(f"Пользователь {uid} отклонён и удалён.")
+
+# Commander menu: start scheduling
 @dp.message(F.text == "📅 Назначить игру")
 async def start_schedule(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     if not is_commander(user_id):
-        await message.answer("Только одобренные командиры могут назначать игры. Сначала зарегистрируйтесь и дождитесь одобрения администратора.")
+        await message.answer("Только одобренные командиры могут назначать игры.")
         return
-    # проверим, есть ли у пользователя team_name
-    tname = user_team_name(user_id)
-    if not tname:
-        await message.answer("Сначала введите название команды (через /start).")
-        return
-
     dates = dates_next_week_iso()
-    inline = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=d, callback_data=f"slot_date:{d}")] for d in dates
-    ])
+    inline = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=d, callback_data=f"slot_date:{d}")] for d in dates])
     await message.answer("Выберите дату (ближайшие 7 дней):", reply_markup=inline)
     await state.set_state(ScheduleStates.choosing_date)
 
@@ -537,54 +406,39 @@ async def on_date_chosen(cb: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="21:00", callback_data=f"slot_time:{date_iso}|21:00")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="slot_back")]
     ])
-    await cb.message.answer(f"Выбрана дата <b>{date_iso}</b>. Выберите время:", reply_markup=kb)
+    await cb.message.answer(f"Выбрана дата <b>{date_iso}</b>. Выберите время:", parse_mode="HTML", reply_markup=kb)
     await cb.answer()
     await state.update_data(chosen_date=date_iso)
     await state.set_state(ScheduleStates.choosing_time)
 
 @dp.callback_query(F.data == "slot_back")
 async def slot_back(cb: types.CallbackQuery, state: FSMContext):
-    # вернуться к выбору даты
     dates = dates_next_week_iso()
-    inline = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=d, callback_data=f"slot_date:{d}")] for d in dates
-    ])
+    inline = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=d, callback_data=f"slot_date:{d}")] for d in dates])
     await cb.message.answer("Выберите дату (ближайшие 7 дней):", reply_markup=inline)
     await cb.answer()
     await state.set_state(ScheduleStates.choosing_date)
 
-
 @dp.callback_query(F.data.startswith("slot_time:"))
 async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
-    """
-    Обновлённый алгоритм: при добавлении заявки собираем пересечения по датам.
-    - если найден кандидат с единственным общим временем -> создаём pending_match сразу (как раньше)
-    - если найден кандидат с несколькими общими временами -> создаём запись в pending_confirmations и просим обе команды выбрать одно время
-    """
     payload = cb.data.split(":", 1)[1]
     date_iso, time_val = payload.split("|", 1)
     user_id = cb.from_user.id
 
-    # проверка роли и названия команды
+    # basic checks
     if not is_commander(user_id):
-        await cb.message.answer("Только одобренные командиры могут назначать игры. Сначала зарегистрируйтесь и дождитесь одобрения администратора.")
-        await cb.answer()
-        return
-    tname = user_team_name(user_id)
-    if not tname:
-        await cb.message.answer("Сначала введите название команды (через /start).")
+        await cb.message.answer("Только одобренные командиры могут назначать игры.")
         await cb.answer()
         return
 
-    # проверка: у этой команды уже есть назначенный матч в этот слот?
-    if has_match(user_id, date_iso, time_val):
-        await cb.message.answer("❌ У вашей команды уже назначен матч в этот день/время.")
+    if has_active_match(user_id, date_iso, time_val):
+        await cb.message.answer("❌ У вашей команды уже есть назначенный матч в этот слот.")
         await cb.answer()
         await state.clear()
         return
 
     conn, cur = conn_cursor()
-    # проверка: есть ли уже заявка этой команды на этот точный слот
+    # check duplicate request
     cur.execute("SELECT id FROM match_requests WHERE team_id=? AND date=? AND time=?", (user_id, date_iso, time_val))
     if cur.fetchone():
         conn.close()
@@ -593,348 +447,240 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    # добавляем заявку текущей команды
+    # insert request
     cur.execute("INSERT INTO match_requests (team_id, date, time) VALUES (?, ?, ?)", (user_id, date_iso, time_val))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
     conn.commit()
 
-    # получаем все заявки других команд на ту же дату
+    # find other teams with requests on the same date
     cur.execute("SELECT team_id, time FROM match_requests WHERE date=? AND team_id!=?", (date_iso, user_id))
-    other_rows = cur.fetchall()
+    rows = cur.fetchall()
+    # map team_id -> set(times)
+    other_times = {}
+    for tid, t in rows:
+        other_times.setdefault(tid, set()).add(t)
 
-    # собираем множества времён у других команд
-    others_times = {}
-    for tid, t in other_rows:
-        others_times.setdefault(tid, set()).add(t)
-
-    # текущее множество времен команды user_id на выбранную дату (включая только что добавленный слот)
+    # get all times of this user on that date
     cur.execute("SELECT time FROM match_requests WHERE date=? AND team_id=?", (date_iso, user_id))
-    my_times = set([r[0] for r in cur.fetchall()])
+    my_times = {r[0] for r in cur.fetchall()}
 
-    # смотрим кандидатов
-    matched = False
-    for candidate_id, times_set in others_times.items():
-        common = sorted(list(my_times.intersection(times_set)))
+    opponent_found = False
+    for candidate_id, times_set in other_times.items():
+        # skip if candidate already has active match at some of these times (safety)
+        # we'll compute intersection
+        common = sorted(list(my_times & times_set))
         if not common:
             continue
 
-        # если общий слот ровно один — создаём pending_match и просим выбрать карту
-        if len(common) == 1:
-            chosen_time = common[0]
-            # проверка свободного сервера
-            free_server = pick_free_server(date_iso, chosen_time)
-            if not free_server:
-                # уведомляем обе команды, заявки остаются
-                cur.execute("SELECT team_name FROM users WHERE user_id=?", (candidate_id,))
-                t1 = cur.fetchone(); t1_name = t1[0] if t1 and t1[0] else f"ID {candidate_id}"
-                cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
-                t2 = cur.fetchone(); t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
-                text = f"⚠️ На {date_iso} {chosen_time} все сервера заняты. Матч между {t1_name} и {t2_name} пока не назначен — заявки сохранены."
-                await send_safe(candidate_id, text)
-                await send_safe(user_id, text)
-                if GROUP_CHAT_ID:
-                    try:
-                        await bot.send_message(GROUP_CHAT_ID, f"Попытка назначить матч {t1_name} vs {t2_name} на {date_iso} {chosen_time}, но все сервера заняты.")
-                    except Exception:
-                        pass
+        # filter out times where candidate or user already have active matches
+        filtered = []
+        for t in common:
+            if has_active_match(candidate_id, date_iso, t) or has_active_match(user_id, date_iso, t):
+                continue
+            filtered.append(t)
+        if not filtered:
+            continue
+
+        # if exactly one common slot -> create match immediately
+        if len(filtered) == 1:
+            chosen_time = filtered[0]
+            # pick server and map automatically
+            server = pick_free_server(date_iso, chosen_time)
+            if not server:
+                # cannot schedule; notify both
+                await send_safe(candidate_id, f"⚠️ Попытка назначить матч на {date_iso} {chosen_time}, но все сервера заняты.")
+                await send_safe(user_id, f"⚠️ Попытка назначить матч на {date_iso} {chosen_time}, но все сервера заняты.")
                 conn.close()
                 await cb.answer()
                 await state.clear()
                 return
 
-            # Создаём pending_match
-            cur.execute(
-                "INSERT INTO pending_matches (team1_id, team2_id, date, time, server, map_choice_team1, map_choice_team2) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
-                (candidate_id, user_id, date_iso, chosen_time, free_server)
-            )
-            pending_id = cur.lastrowid
-            # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-
-            # удаляем соответствующие заявки на этот слот (если есть)
+            chosen_map = make_map_choice()
+            # insert into matches
+            cur.execute("INSERT INTO matches (team1_id, team2_id, date, time, server, map) VALUES (?, ?, ?, ?, ?, ?)",
+                        (candidate_id, user_id, date_iso, chosen_time, server, chosen_map))
+            match_id = cur.lastrowid
+            # delete both requests for that timeslot
             cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (candidate_id, date_iso, chosen_time))
             cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (user_id, date_iso, chosen_time))
-            # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
+            conn.commit()
 
-    conn.commit()
-
-            # формируем клавиатуру выбора карт
-            def make_map_kb(pending_id):
-                rows = []
-                row = []
-                for i, m in enumerate(MAP_LIST, 1):
-                    row.append(InlineKeyboardButton(text=m, callback_data=f"map_pick:{pending_id}:{m}"))
-                    if i % 3 == 0:
-                        rows.append(row)
-                        row = []
-                if row:
-                    rows.append(row)
-                return InlineKeyboardMarkup(inline_keyboard=rows)
-
-            kb = make_map_kb(pending_id)
-
-            # уведомляем обе команды
+            # notify teams
             cur.execute("SELECT team_name FROM users WHERE user_id=?", (candidate_id,))
-            t1 = cur.fetchone(); t1_name = t1[0] if t1 and t1[0] else f"ID {candidate_id}"
+            r1 = cur.fetchone(); name1 = r1[0] if r1 and r1[0] else f"ID {candidate_id}"
             cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
-            t2 = cur.fetchone(); t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
+            r2 = cur.fetchone(); name2 = r2[0] if r2 and r2[0] else f"ID {user_id}"
 
-            text_msg = (f"🔔 Найден соперник!\nМатч: {t1_name} vs {t2_name}\n📅 {date_iso} ⏰ {chosen_time}\n🌐 Сервер: {free_server}\n\nПожалуйста, выберите карту:")
-            await send_safe(candidate_id, text_msg)
-            await send_safe(user_id, text_msg)
-            try:
-                await bot.send_message(candidate_id, "Выберите карту для матча:", reply_markup=kb)
-            except Exception:
-                logger.info("Не удалось отправить выбор карты команде %s", candidate_id)
-            try:
-                await bot.send_message(user_id, "Выберите карту для матча:", reply_markup=kb)
-            except Exception:
-                logger.info("Не удалось отправить выбор карты команде %s", user_id)
-
+            text = f"⚔️ Назначен матч!\nID {match_id}\n📅 {date_iso} ⏰ {chosen_time}\n🏆 {name1} vs {name2}\n🌐 Сервер: {server}\n🗺 Карта: {chosen_map}"
+            await send_safe(candidate_id, text)
+            await send_safe(user_id, text)
             if GROUP_CHAT_ID:
                 try:
-                    await bot.send_message(GROUP_CHAT_ID, f"Матч ожидает выбора карт: {t1_name} vs {t2_name} — {date_iso} {chosen_time} — Сервер: {free_server}")
+                    await bot.send_message(GROUP_CHAT_ID, text)
                 except Exception:
                     pass
-
-            matched = True
+            await cb.message.answer(f"Матч назначен: {name1} vs {name2} (ID {match_id})")
+            await cb.answer()
+            conn.close()
+            opponent_found = True
             break
 
-        # если есть несколько общих слотов -> создаём pending_confirmations и просим подтвердить время
-        if len(common) > 1:
-            times_csv = ",".join(common)
-            cur.execute("INSERT INTO pending_confirmations (team1_id, team2_id, date, times_csv, choice_team1, choice_team2) VALUES (?, ?, ?, ?, NULL, NULL)",
+        # if multiple common slots -> create pending_confirmations row and ask both to pick a slot
+        if len(filtered) > 1:
+            times_csv = ",".join(filtered)
+            cur.execute("INSERT INTO pending_confirmations (team1_id, team2_id, date, times_csv) VALUES (?, ?, ?, ?)",
                         (candidate_id, user_id, date_iso, times_csv))
             pc_id = cur.lastrowid
-            # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
+            conn.commit()
 
-    conn.commit()
-
-            # кнопки для выбора времени
-            buttons = [[InlineKeyboardButton(text=t, callback_data=f"confirm_time:{pc_id}:{t}")] for t in common]
+            buttons = [[InlineKeyboardButton(text=t, callback_data=f"confirm_time:{pc_id}:{t}")] for t in filtered]
             buttons.append([InlineKeyboardButton(text="❌ Отказаться", callback_data=f"confirm_time:{pc_id}:CANCEL")])
             kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
             cur.execute("SELECT team_name FROM users WHERE user_id=?", (candidate_id,))
-            t1 = cur.fetchone(); t1_name = t1[0] if t1 and t1[0] else f"ID {candidate_id}"
+            r1 = cur.fetchone(); name1 = r1[0] if r1 and r1[0] else f"ID {candidate_id}"
             cur.execute("SELECT team_name FROM users WHERE user_id=?", (user_id,))
-            t2 = cur.fetchone(); t2_name = t2[0] if t2 and t2[0] else f"ID {user_id}"
+            r2 = cur.fetchone(); name2 = r2[0] if r2 and r2[0] else f"ID {user_id}"
 
-            txt = (f"🔔 Найден соперник: {t1_name} vs {t2_name}\n"
-                   f"📅 {date_iso}\n"
-                   f"У вас общие времена: {', '.join(common)}\n"
-                   f"Пожалуйста, выберите одно из них (оба должны выбрать одинаковый слот):")
+            txt = (f"🔔 Найден соперник: {name1} vs {name2}\n📅 {date_iso}\n"
+                   f"У вас общие времена: {', '.join(filtered)}\n"
+                   f"Оба должны выбрать одно и то же время для подтверждения матча.")
             await send_safe(candidate_id, txt)
             await send_safe(user_id, txt)
             try:
                 await bot.send_message(candidate_id, "Выберите время:", reply_markup=kb)
             except Exception:
-                logger.info("Не удалось отправить кнопку выбора времени команде %s", candidate_id)
+                pass
             try:
                 await bot.send_message(user_id, "Выберите время:", reply_markup=kb)
             except Exception:
-                logger.info("Не удалось отправить кнопку выбора времени команде %s", user_id)
+                pass
 
-            matched = True
+            conn.close()
+            opponent_found = True
             break
 
-    conn.close()
-    if not matched:
+    if not opponent_found:
+        conn.close()
         await cb.message.answer(f"✅ Ваша заявка сохранена на {date_iso} {time_val}. Ожидаем соперника.")
+        await cb.answer()
+        await state.clear()
+        return
+
     await cb.answer()
     await state.clear()
 
-# ---- Обработка выбора карты (callback) ----
-@dp.callback_query(F.data.startswith("map_pick:"))
-async def on_map_pick(cb: types.CallbackQuery):
-    """
-    Callback data: map_pick:{pending_id}:{map_name}
-    Определяем, кто нажал (team1 или team2) и сохраняем выбор.
-    Если оба выбрали — случайно выбираем итоговую карту из двух вариантов, создаём запись в matches,
-    удаляем pending_matches, удаляем заявки обеих команд и уведомляем команды/группу.
-    """
+@dp.callback_query(F.data.startswith("confirm_time:"))
+async def handle_confirm_time(cb: types.CallbackQuery):
+    # callback_data: confirm_time:{pc_id}:{choice_or_CANCEL}
+    payload = cb.data.split(":", 1)[1]
     try:
-        _, payload = cb.data.split(":", 1)
-        pending_id_str, map_choice = payload.split(":", 1)
-        pending_id = int(pending_id_str)
+        pc_id_str, choice = payload.split(":", 1)
+        pc_id = int(pc_id_str)
     except Exception:
-        await cb.answer("Неверный callback.")
+        await cb.answer("Неверные данные.")
         return
 
     user_id = cb.from_user.id
     conn, cur = conn_cursor()
-    cur.execute("SELECT team1_id, team2_id, date, time, server, map_choice_team1, map_choice_team2 FROM pending_matches WHERE id=?", (pending_id,))
+    cur.execute("SELECT team1_id, team2_id, date, times_csv, choice_team1, choice_team2 FROM pending_confirmations WHERE id=?", (pc_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
-        await cb.answer("Этот матч уже обработан или не найден.")
+        await cb.answer("Запрос подтверждения уже обработан или не найден.")
         return
+    t1, t2, date_iso, times_csv, c1, c2 = row
+    times = times_csv.split(",") if times_csv else []
 
-    team1_id, team2_id, date_iso, time_val, server, m1, m2 = row
-
-    # проверим, что нажатие делает именно командир одной из учавствующих команд
-    if user_id != team1_id and user_id != team2_id:
+    if user_id != t1 and user_id != t2:
         conn.close()
-        await cb.answer("Вы не участвуете в этом матче.")
+        await cb.answer("Вы не участник этого подтверждения.")
         return
 
-    # сохраняем выбор
-    if user_id == team1_id:
-        cur.execute("UPDATE pending_matches SET map_choice_team1=? WHERE id=?", (map_choice, pending_id))
-        # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
+    if choice == "CANCEL":
+        cur.execute("DELETE FROM pending_confirmations WHERE id=?", (pc_id,))
+        conn.commit()
+        conn.close()
+        await send_safe(t1, "❌ Подтверждение времени отменено. Поиск соперника продолжается.")
+        await send_safe(t2, "❌ Подтверждение времени отменено. Поиск соперника продолжается.")
+        await cb.answer("Вы отменили подтверждение.")
+        return
 
-    conn.commit()
-        await cb.answer(f"Вы выбрали карту: {map_choice}")
+    if choice not in times:
+        conn.close()
+        await cb.answer("Неверный выбор времени.")
+        return
+
+    if user_id == t1:
+        cur.execute("UPDATE pending_confirmations SET choice_team1=? WHERE id=?", (choice, pc_id))
     else:
-        cur.execute("UPDATE pending_matches SET map_choice_team2=? WHERE id=?", (map_choice, pending_id))
-        # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-        await cb.answer(f"Вы выбрали карту: {map_choice}")
-
-    # проверяем, выбрала ли вторая команда
-    cur.execute("SELECT map_choice_team1, map_choice_team2 FROM pending_matches WHERE id=?", (pending_id,))
-    row2 = cur.fetchone()
-    if not row2:
-        conn.close()
-        return
-    choice1, choice2 = row2
-
-    # если оба выбор есть — финализируем матч
-    if choice1 and choice2:
-        # выбрать итоговую карту случайно из двух выбранных
-        final_map = random.choice([choice1, choice2])
-        # создаём запись в matches
-        cur.execute("INSERT INTO matches (team1_id, team2_id, date, time, server, map) VALUES (?, ?, ?, ?, ?, ?)",
-                    (team1_id, team2_id, date_iso, time_val, server, final_map))
-        match_id = cur.lastrowid
-        # удаляем pending
-        cur.execute("DELETE FROM pending_matches WHERE id=?", (pending_id,))
-        # удаляем заявки обеих команд на этот слот (если остались)
-        try:
-            cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (team1_id, date_iso, time_val))
-            cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (team2_id, date_iso, time_val))
-        except Exception:
-            logger.exception("Ошибка при удалении заявок при финализации матча.")
-        # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
+        cur.execute("UPDATE pending_confirmations SET choice_team2=? WHERE id=?", (choice, pc_id))
     conn.commit()
 
-        # уведомляем команды
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (team1_id,))
-        r1 = cur.fetchone()
-        n1 = r1[0] if r1 and r1[0] else f"ID {team1_id}"
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (team2_id,))
-        r2 = cur.fetchone()
-        n2 = r2[0] if r2 and r2[0] else f"ID {team2_id}"
-
-        text = (f"⚔️ <b>Матч назначен</b>!\n"
-                f"ID {match_id}\n"
-                f"📅 {date_iso} ⏰ {time_val}\n"
-                f"🏆 {n1} vs {n2}\n"
-                f"🌐 Сервер: {server}\n"
-                f"🗺 Карта: {final_map}")
-        # отправляем ЛС обеим командам
-        await send_safe(team1_id, text)
-        await send_safe(team2_id, text)
-        # отправляем в group chat, если задан
-        if GROUP_CHAT_ID:
-            try:
-                await bot.send_message(GROUP_CHAT_ID, text)
-            except Exception:
-                pass
-
-        await cb.message.answer(f"Матч окончательно назначен: {n1} vs {n2} (ID {match_id}). Карта: {final_map}", reply_markup=ReplyKeyboardRemove())
-        conn.close()
-        return
-
+    cur.execute("SELECT choice_team1, choice_team2 FROM pending_confirmations WHERE id=?", (pc_id,))
+    ch = cur.fetchone()
     conn.close()
-    # если второй ещё не выбрал — просто подтверждение уже дано
-    await cb.message.answer("Ваш выбор принят. Ожидаем выбор соперника.")
-    return
+    choice1, choice2 = ch if ch else (None, None)
 
-# ---- Просмотр заявок / расписания / матчи для командиров ----
+    await cb.answer("Ваш выбор принят. Ожидаем соперника.")
+    if choice1 and choice2:
+        if choice1 == choice2:
+            # both chose same -> create match
+            conn, cur = conn_cursor()
+            cur.execute("SELECT team1_id, team2_id, date FROM pending_confirmations WHERE id=?", (pc_id,))
+            row2 = cur.fetchone()
+            if not row2:
+                conn.close()
+                return
+            t1id, t2id, date_iso = row2
+            chosen_time = choice1
+            server = pick_free_server(date_iso, chosen_time)
+            if not server:
+                cur.execute("DELETE FROM pending_confirmations WHERE id=?", (pc_id,))
+                conn.commit()
+                conn.close()
+                await send_safe(t1id, f"⚠️ Все сервера заняты на {date_iso} {chosen_time}. Попробуйте другой слот.")
+                await send_safe(t2id, f"⚠️ Все сервера заняты на {date_iso} {chosen_time}. Попробуйте другой слот.")
+                return
+            chosen_map = make_map_choice()
+            cur.execute("INSERT INTO matches (team1_id, team2_id, date, time, server, map) VALUES (?, ?, ?, ?, ?, ?)",
+                        (t1id, t2id, date_iso, chosen_time, server, chosen_map))
+            match_id = cur.lastrowid
+            # remove pending_confirmations and relevant requests
+            cur.execute("DELETE FROM pending_confirmations WHERE id=?", (pc_id,))
+            cur.execute("DELETE FROM match_requests WHERE team_id IN (?, ?) AND date=? AND time=?", (t1id, t2id, date_iso, chosen_time))
+            conn.commit()
+            # notify
+            cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1id,))
+            n1 = cur.fetchone(); n1s = n1[0] if n1 and n1[0] else f"ID {t1id}"
+            cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2id,))
+            n2 = cur.fetchone(); n2s = n2[0] if n2 and n2[0] else f"ID {t2id}"
+            text = f"⚔️ Назначен матч!\nID {match_id}\n📅 {date_iso} ⏰ {chosen_time}\n🏆 {n1s} vs {n2s}\n🌐 Сервер: {server}\n🗺 Карта: {chosen_map}"
+            await send_safe(t1id, text)
+            await send_safe(t2id, text)
+            if GROUP_CHAT_ID:
+                try:
+                    await bot.send_message(GROUP_CHAT_ID, text)
+                except Exception:
+                    pass
+            conn.close()
+        else:
+            # mismatch -> cancel and notify
+            conn, cur = conn_cursor()
+            cur.execute("SELECT team1_id, team2_id FROM pending_confirmations WHERE id=?", (pc_id,))
+            pr = cur.fetchone()
+            if pr:
+                t1id, t2id = pr
+                cur.execute("DELETE FROM pending_confirmations WHERE id=?", (pc_id,))
+                conn.commit()
+                conn.close()
+                await send_safe(t1id, "⛔ Выбор времени не совпал. Поиск соперника продолжается.")
+                await send_safe(t2id, "⛔ Выбор времени не совпал. Поиск соперника продолжается.")
+            else:
+                conn.close()
+
+# Commander: view own requests
 @dp.message(F.text == "📖 Мое расписание")
-async def my_requests(message: types.Message):
+async def my_schedule(message: types.Message):
     user_id = message.from_user.id
     conn, cur = conn_cursor()
     cur.execute("SELECT date, time FROM match_requests WHERE team_id=?", (user_id,))
@@ -946,295 +692,173 @@ async def my_requests(message: types.Message):
     lines = [f"{d} {t}" for d, t in rows]
     await message.answer("📅 Ваши заявки:\n" + "\n".join(lines))
 
+# Commander: view active matches
 @dp.message(F.text == "📜 Мои матчи")
 async def my_matches(message: types.Message):
     user_id = message.from_user.id
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server, map FROM matches WHERE team1_id=? OR team2_id=?", (user_id, user_id))
+    cur.execute("SELECT id, team1_id, team2_id, date, time, server, map, result FROM matches WHERE team1_id=? OR team2_id=? ORDER BY date, time", (user_id, user_id))
     rows = cur.fetchall()
     conn.close()
     if not rows:
         await message.answer("У вашей команды пока нет назначенных матчей.")
         return
-    # Формируем вывод
     text_lines = []
     conn, cur = conn_cursor()
-    for mid, t1, t2, d, tm, res, srv, mp in rows:
+    for mid, t1, t2, d, tm, srv, mp, res in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        r1 = cur.fetchone()
-        n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
+        r1 = cur.fetchone(); n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        r2 = cur.fetchone()
-        n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
-        srv_text = f" | Сервер: {srv}" if srv else ""
-        map_text = f" | Карта: {mp}" if mp else ""
-        text_lines.append(f"ID {mid}: {d} {tm} — {n1} vs {n2}{srv_text}{map_text} | {res or 'результат не задан'}")
+        r2 = cur.fetchone(); n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
+        text_lines.append(f"ID {mid}: {d} {tm} — {n1} vs {n2} | Сервер: {srv} | Карта: {mp} | {res or 'результат не задан'}")
     conn.close()
     await message.answer("📜 Ваши матчи:\n" + "\n".join(text_lines))
 
-# ---- История матчей для командиров (год -> месяц -> день) ----
+# Commander: view history (uses match_history table) - implemented as year->month->day selection
 @dp.message(F.text == "📚 История матчей")
 async def history_start(message: types.Message, state: FSMContext):
-    """
-    Для командиров показывает историю только их команды (результаты).
-    Для судей этот же хэндлер также запустит судейский путь (см judge_history_start).
-    """
     user_id = message.from_user.id
-
-    if is_judge(user_id):
-        # запустить судейский путь
-        await judge_history_start(message, state)
-        return
-
-    # командирская логика:
     conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT DISTINCT strftime('%Y', date) as year
-        FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
-        ORDER BY year DESC
-    """, (user_id, user_id))
+    cur.execute("SELECT DISTINCT strftime('%Y', date) FROM match_history WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL ORDER BY 1 DESC", (user_id, user_id))
     rows = cur.fetchall()
     conn.close()
-
     years = [r[0] for r in rows if r and r[0]]
     if not years:
         await message.answer("История матчей пуста.", reply_markup=commander_menu)
         return
-
-    inline = InlineKeyboardMarkup(row_width=2)
-    buttons = []
-    for y in years:
-        buttons.append(InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}"))
+    inline = InlineKeyboardMarkup(row_width=3)
+    buttons = [InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}") for y in years]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
     inline.add(*buttons)
-
     await message.answer("Выберите год:", reply_markup=inline)
     await state.set_state(HistoryStates.choosing_year)
 
 @dp.callback_query(F.data.startswith("hist_year:"))
-async def history_year_chosen(cb: types.CallbackQuery, state: FSMContext):
-    year = cb.data.split(":", 1)[1]
+async def hist_year(cb: types.CallbackQuery, state: FSMContext):
+    year = cb.data.split(":",1)[1]
     user_id = cb.from_user.id
-
     await state.update_data(year=year)
-
     conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT DISTINCT strftime('%m', date) as month
-        FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
-        ORDER BY month
-    """, (user_id, user_id, year))
+    cur.execute("SELECT DISTINCT strftime('%m', date) FROM match_history WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=? ORDER BY 1", (user_id, user_id, year))
     rows = cur.fetchall()
     conn.close()
-
     months = [r[0] for r in rows if r and r[0]]
     if not months:
         await cb.message.answer("Нет матчей в этом году.", reply_markup=commander_menu)
         await cb.answer()
         await state.clear()
         return
-
-    inline = InlineKeyboardMarkup(row_width=3)
+    inline = InlineKeyboardMarkup(row_width=4)
     buttons = [InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}") for m in months]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:year"))
     inline.add(*buttons)
-
     await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
     await cb.answer()
     await state.set_state(HistoryStates.choosing_month)
 
 @dp.callback_query(F.data.startswith("hist_month:"))
-async def history_month_chosen(cb: types.CallbackQuery, state: FSMContext):
-    month = cb.data.split(":", 1)[1]
+async def hist_month(cb: types.CallbackQuery, state: FSMContext):
+    month = cb.data.split(":",1)[1]
     user_id = cb.from_user.id
-
-    await state.update_data(month=month)
     data = await state.get_data()
     year = data.get("year")
-
+    await state.update_data(month=month)
     conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT DISTINCT strftime('%d', date) as day
-        FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
-          AND strftime('%Y', date)=? AND strftime('%m', date)=?
-        ORDER BY day
-    """, (user_id, user_id, year, month))
+    cur.execute("SELECT DISTINCT strftime('%d', date) FROM match_history WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=? AND strftime('%m', date)=? ORDER BY 1", (user_id, user_id, year, month))
     rows = cur.fetchall()
     conn.close()
-
     days = [r[0] for r in rows if r and r[0]]
     if not days:
         await cb.message.answer("Нет матчей в этом месяце.", reply_markup=commander_menu)
         await cb.answer()
         await state.clear()
         return
-
-    inline = InlineKeyboardMarkup(row_width=4)
+    inline = InlineKeyboardMarkup(row_width=6)
     buttons = [InlineKeyboardButton(text=d, callback_data=f"hist_day:{d}") for d in days]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:month"))
     inline.add(*buttons)
-
     await cb.message.answer(f"Выбран {year}-{month}. Выберите день:", reply_markup=inline)
     await cb.answer()
     await state.set_state(HistoryStates.choosing_day)
 
 @dp.callback_query(F.data.startswith("hist_day:"))
-async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
-    day = cb.data.split(":", 1)[1]
+async def hist_day(cb: types.CallbackQuery, state: FSMContext):
+    day = cb.data.split(":",1)[1]
     data = await state.get_data()
-    year = data.get("year")
-    month = data.get("month")
+    year = data.get("year"); month = data.get("month")
     user_id = cb.from_user.id
-
-    y = year
-    m = month.zfill(2)
-    d = day.zfill(2)
-    date_iso = f"{y}-{m}-{d}"
-
+    date_iso = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
     conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT id, team1_id, team2_id, time, result, server, map
-        FROM matches
-        WHERE date=? AND (team1_id=? OR team2_id=?)
-        ORDER BY time
-    """, (date_iso, user_id, user_id))
+    cur.execute("SELECT id, team1_id, team2_id, time, server, map, result FROM match_history WHERE date=? AND (team1_id=? OR team2_id=?) ORDER BY time", (date_iso, user_id, user_id))
     rows = cur.fetchall()
     conn.close()
-
     if not rows:
-        await cb.message.answer(f"Матчей за {date_iso} не найдено.", reply_markup=commander_menu)
+        await cb.message.answer("Матчей за этот день не найдено.", reply_markup=commander_menu)
         await cb.answer()
         await state.clear()
         return
-
     lines = []
-    for mid, t1, t2, tm, res, srv, mp in rows:
-        conn, cur = conn_cursor()
+    conn, cur = conn_cursor()
+    for mid, t1, t2, tm, srv, mp, res in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        r1 = cur.fetchone()
-        name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
+        r1 = cur.fetchone(); n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        r2 = cur.fetchone()
-        name2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
-        conn.close()
-        srv_text = f" | Сервер: {srv}" if srv else ""
-        map_text = f" | Карта: {mp}" if mp else ""
-        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text}{map_text} | {res or 'результат не задан'}")
-
+        r2 = cur.fetchone(); n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
+        lines.append(f"ID {mid}: {tm} — {n1} vs {n2} | Сервер: {srv} | Карта: {mp} | {res}")
+    conn.close()
     await cb.message.answer(f"📚 История матчей за {date_iso}:\n" + "\n".join(lines), reply_markup=commander_menu)
     await cb.answer()
     await state.clear()
 
 @dp.callback_query(F.data.startswith("hist_back:"))
-async def history_back(cb: types.CallbackQuery, state: FSMContext):
-    payload = cb.data.split(":", 1)[1]
+async def hist_back(cb: types.CallbackQuery, state: FSMContext):
+    payload = cb.data.split(":",1)[1]
     user_id = cb.from_user.id
-
     if payload == "menu":
-        await cb.message.answer("Возврат в меню командира:", reply_markup=commander_menu)
+        if is_commander(user_id):
+            await cb.message.answer("Возврат в меню:", reply_markup=commander_menu)
+        else:
+            await cb.message.answer("Возврат в меню:", reply_markup=role_kb)
         await cb.answer()
         await state.clear()
         return
-
     if payload == "year":
-        conn, cur = conn_cursor()
-        cur.execute("""
-            SELECT DISTINCT strftime('%Y', date) as year
-            FROM matches
-            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
-            ORDER BY year DESC
-        """, (user_id, user_id))
-        rows = cur.fetchall()
-        conn.close()
-        years = [r[0] for r in rows if r and r[0]]
-        if not years:
-            await cb.message.answer("История пуста.", reply_markup=commander_menu)
-            await cb.answer()
-            await state.clear()
-            return
-        inline = InlineKeyboardMarkup(row_width=2)
-        buttons = [InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}") for y in years]
-        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
-        inline.add(*buttons)
-        await cb.message.answer("Выберите год:", reply_markup=inline)
-        await cb.answer()
-        await state.set_state(HistoryStates.choosing_year)
-        return
-
+        await hist_year(cb, state)
     if payload == "month":
-        data = await state.get_data()
-        year = data.get("year")
-        if not year:
-            await cb.message.answer("Ошибка: год не выбран.", reply_markup=commander_menu)
-            await cb.answer()
-            await state.clear()
-            return
-        conn, cur = conn_cursor()
-        cur.execute("""
-            SELECT DISTINCT strftime('%m', date) as month
-            FROM matches
-            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
-            ORDER BY month
-        """, (user_id, user_id, year))
-        rows = cur.fetchall()
-        conn.close()
-        months = [r[0] for r in rows if r and r[0]]
-        if not months:
-            await cb.message.answer("Нет матчей в этом году.", reply_markup=commander_menu)
-            await cb.answer()
-            await state.clear()
-            return
-        inline = InlineKeyboardMarkup(row_width=3)
-        buttons = [InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}") for m in months]
-        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:year"))
-        inline.add(*buttons)
-        await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
-        await cb.answer()
-        await state.set_state(HistoryStates.choosing_month)
-        return
+        await hist_month(cb, state)
 
-    await cb.answer()
-
-# ---- Судья: посмотреть все матчи (для судей) ----
+# ----------------- Judge: list all active matches -----------------
 @dp.message(F.text == "📜 Все матчи")
 async def all_matches(message: types.Message):
     user_id = message.from_user.id
     if not is_judge(user_id):
-        await message.answer("Только для судей.")
+        await message.answer("Только судьи могут просматривать все матчи.")
         return
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time, result, server, map FROM matches ORDER BY date, time")
+    cur.execute("SELECT id, team1_id, team2_id, date, time, server, map, result FROM matches ORDER BY date, time")
     rows = cur.fetchall()
     conn.close()
     if not rows:
         await message.answer("Пока нет назначенных матчей.")
         return
-    text_lines = []
+    lines = []
     conn, cur = conn_cursor()
-    for mid, t1, t2, d, tm, res, srv, mp in rows:
+    for mid, t1, t2, d, tm, srv, mp, res in rows:
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        r1 = cur.fetchone()
-        name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
+        r1 = cur.fetchone(); n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        r2 = cur.fetchone()
-        name2 = r2[0] if r2 and r2[0] else f"ID {t2}"
-        srv_text = f" | Сервер: {srv}" if srv else ""
-        map_text = f" | Карта: {mp}" if mp else ""
-        text_lines.append(f"ID {mid}: {d} {tm}{srv_text}{map_text} — {name1} vs {name2} | {res or 'результат не задан'}")
+        r2 = cur.fetchone(); n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
+        lines.append(f"ID {mid}: {d} {tm} — {n1} vs {n2} | Сервер: {srv} | Карта: {mp} | {res or 'результат не задан'}")
     conn.close()
-    await message.answer("📜 Все матчи:\n" + "\n".join(text_lines))
+    await message.answer("📜 Все матчи:\n" + "\n".join(lines))
 
-# ---- Судья: выбрать матч для добавления результата (inline) ----
+# Judge: choose match to enter result
 @dp.message(F.text == "📝 Внести результат")
 async def judge_choose_match_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     if not is_judge(user_id):
         await message.answer("Только судья может вносить результат.")
         return
-
     conn, cur = conn_cursor()
     cur.execute("SELECT id, team1_id, team2_id, date, time FROM matches WHERE result IS NULL ORDER BY date, time")
     rows = cur.fetchall()
@@ -1242,28 +866,23 @@ async def judge_choose_match_start(message: types.Message, state: FSMContext):
     if not rows:
         await message.answer("Нет матчей без результата.")
         return
-
-    inline_buttons = []
+    inline = InlineKeyboardMarkup()
     for mid, t1, t2, d, tm in rows:
         conn, cur = conn_cursor()
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        r1 = cur.fetchone()
-        n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
+        r1 = cur.fetchone(); n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        r2 = cur.fetchone()
-        n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
+        r2 = cur.fetchone(); n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
         conn.close()
-        inline_buttons.append([InlineKeyboardButton(text=f"ID {mid}: {d} {tm} — {n1} vs {n2}", callback_data=f"judge_pick:{mid}")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=inline_buttons)
-    await message.answer("Выберите матч для ввода результата:", reply_markup=kb)
+        inline.add(InlineKeyboardButton(text=f"ID {mid}: {d} {tm} — {n1} vs {n2}", callback_data=f"judge_pick:{mid}"))
+    await message.answer("Выберите матч для ввода результата:", reply_markup=inline)
     await state.set_state(JudgeStates.choosing_match)
 
 @dp.callback_query(JudgeStates.choosing_match, F.data.startswith("judge_pick:"))
 async def judge_pick_match(cb: types.CallbackQuery, state: FSMContext):
-    mid = int(cb.data.split(":", 1)[1])
+    mid = int(cb.data.split(":",1)[1])
     await state.update_data(chosen_match_id=mid)
-    await cb.message.answer(f"Введите результат для матча ID {mid} в произвольном формате (пример: 2-1 или Team1 2:1 Team2):")
+    await cb.message.answer(f"Введите результат для матча ID {mid} (пример: 2-1 или TeamA 2:1 TeamB):")
     await cb.answer()
     await state.set_state(JudgeStates.entering_result)
 
@@ -1272,138 +891,98 @@ async def judge_save_result(message: types.Message, state: FSMContext):
     data = await state.get_data()
     mid = data.get("chosen_match_id")
     if not mid:
-        await message.answer("Произошла ошибка: матч не выбран. Повторите операцию.")
+        await message.answer("Ошибка: матч не выбран.")
         await state.clear()
         return
     result_text = message.text.strip()
+
     conn, cur = conn_cursor()
-    # переносим матч в историю и удаляем из matches
-    cur.execute("SELECT team1_id, team2_id, date, time FROM matches WHERE id=?", (mid,))
-    match_row = cur.fetchone()
-    if match_row:
-        t1, t2, d, tm = match_row
-        cur.execute("INSERT INTO match_history (team1_id, team2_id, date, time, result, judge_id) VALUES (?, ?, ?, ?, ?, ?)",
-                    (t1, t2, d, tm, result_text, message.from_user.id))
-        cur.execute("DELETE FROM matches WHERE id=?", (mid,))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-
-    # уведомить команды
-    cur.execute("SELECT team1_id, team2_id, date, time FROM matches WHERE id=?", (mid,))
+    # get match info
+    cur.execute("SELECT team1_id, team2_id, date, time, server, map FROM matches WHERE id=?", (mid,))
     row = cur.fetchone()
-    if row:
-        team1_id, team2_id, d, tm = row
-        # отправляем ЛС, если возможно
-        await send_safe(team1_id, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
-        if team2_id:
-            await send_safe(team2_id, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
-        # group notify
-        if GROUP_CHAT_ID:
-            try:
-                await bot.send_message(GROUP_CHAT_ID, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
-            except Exception as e:
-                logger.info("Не удалось отправить group notify: %s", e)
+    if not row:
+        await message.answer("Матч не найден.")
+        conn.close()
+        await state.clear()
+        return
+    t1, t2, d, tm, srv, mp = row
 
+    # insert into history
+    cur.execute("INSERT INTO match_history (team1_id, team2_id, date, time, server, map, judge_id, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (t1, t2, d, tm, srv, mp, message.from_user.id, result_text))
+    # delete from matches
+    cur.execute("DELETE FROM matches WHERE id=?", (mid,))
+    conn.commit()
     conn.close()
-    await message.answer(f"✅ Результат для матча ID {mid} сохранён.")
+
+    # notify teams
+    await send_safe(t1, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
+    if t2:
+        await send_safe(t2, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
+    if GROUP_CHAT_ID:
+        try:
+            await bot.send_message(GROUP_CHAT_ID, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
+        except Exception:
+            pass
+
+    await message.answer(f"✅ Результат для матча ID {mid} сохранён и матч перенесён в историю.")
     await state.clear()
 
-# ---- Судья: удалить матч (inline selection) ----
+# Judge: delete match
 @dp.message(F.text == "🗑 Удалить матч")
 async def judge_delete_match_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     if not is_judge(user_id):
         await message.answer("Только судья может удалять матчи.")
         return
-
     conn, cur = conn_cursor()
-    cur.execute("SELECT id, team1_id, team2_id, date, time FROM matches ORDER BY date, time")
+    cur.execute("SELECT id, team1_id, team2_id, date, time, server, map FROM matches ORDER BY date, time")
     rows = cur.fetchall()
     conn.close()
     if not rows:
         await message.answer("Нет матчей для удаления.")
         return
-
-    inline_buttons = []
-    for mid, t1, t2, d, tm in rows:
+    inline = InlineKeyboardMarkup()
+    for mid, t1, t2, d, tm, srv, mp in rows:
         conn, cur = conn_cursor()
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        r1 = cur.fetchone()
-        n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
+        r1 = cur.fetchone(); n1 = r1[0] if r1 and r1[0] else f"ID {t1}"
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        r2 = cur.fetchone()
-        n2 = r2[0] if r2 and r2[0] else f"ID {t2}" if t2 else "??"
+        r2 = cur.fetchone(); n2 = r2[0] if r2 and r2[0] else f"ID {t2}"
         conn.close()
-        inline_buttons.append([InlineKeyboardButton(text=f"ID {mid}: {d} {tm} — {n1} vs {n2}", callback_data=f"del_match:{mid}")])
+        inline.add(InlineKeyboardButton(text=f"ID {mid}: {d} {tm} — {n1} vs {n2}", callback_data=f"del_match:{mid}"))
+    await message.answer("Выберите матч для удаления:", reply_markup=inline)
+    await state.set_state(DeleteStates.choosing_delete)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=inline_buttons)
-    await message.answer("Выберите матч для удаления:", reply_markup=kb)
-    await state.set_state(DeleteStates.choosing_delete_match)
-
-@dp.callback_query(DeleteStates.choosing_delete_match, F.data.startswith("del_match:"))
+@dp.callback_query(DeleteStates.choosing_delete, F.data.startswith("del_match:"))
 async def judge_confirm_delete(cb: types.CallbackQuery, state: FSMContext):
-    mid = int(cb.data.split(":", 1)[1])
+    mid = int(cb.data.split(":",1)[1])
     conn, cur = conn_cursor()
     cur.execute("SELECT team1_id, team2_id, date, time FROM matches WHERE id=?", (mid,))
     row = cur.fetchone()
     if not row:
-        await cb.message.answer("Матч не найден.")
         conn.close()
-        await state.clear()
+        await cb.message.answer("Матч не найден.")
         await cb.answer()
+        await state.clear()
         return
     t1, t2, d, tm = row
-    # удаляем сам матч
     cur.execute("DELETE FROM matches WHERE id=?", (mid,))
-    # удаляем также заявки обеих команд на эту дату/время (если есть)
-    try:
-        cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (t1, d, tm))
-        cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (t2, d, tm))
-    except Exception as e:
-        logger.info("Ошибка при удалении заявок: %s", e)
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
     conn.commit()
     conn.close()
-
-    # уведомления
-    await cb.message.answer(f"Матч ID {mid} удалён ✅ (матч и заявки удалены)")
-    await send_safe(t1, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}). Ваши заявки на {d} {tm} также удалены.")
+    await cb.message.answer(f"Матч ID {mid} удалён ✅")
+    await send_safe(t1, f"❌ Матч ID {mid} ({d} {tm}) был удалён судьёй.")
     if t2:
-        await send_safe(t2, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}). Ваши заявки на {d} {tm} также удалены.")
+        await send_safe(t2, f"❌ Матч ID {mid} ({d} {tm}) был удалён судьёй.")
     if GROUP_CHAT_ID:
         try:
-            await bot.send_message(GROUP_CHAT_ID, f"❌ Матч ID {mid} был удалён судьёй ({d} {tm}).")
+            await bot.send_message(GROUP_CHAT_ID, f"❌ Матч ID {mid} ({d} {tm}) был удалён судьёй.")
         except Exception:
             pass
-
-    await state.clear()
     await cb.answer()
+    await state.clear()
 
-# --------------- Обработка кнопки "🔙 Назад" ---------------
+# ----------------- Back button handler -----------------
 @dp.message(F.text == "🔙 Назад")
 async def back_to_menu(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -1415,302 +994,38 @@ async def back_to_menu(message: types.Message, state: FSMContext):
         await message.answer("Возврат в главное меню:", reply_markup=role_kb)
     await state.clear()
 
-# --- Судейская история матчей (год -> месяц -> день): показывает ВСЕ матчи (результаты) ---
-async def judge_history_start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    # Пошаговый выбор для судей: годы, месяцы, дни — по всем матчам с результатами
-    conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT DISTINCT strftime('%Y', date) as year
-        FROM matches
-        WHERE result IS NOT NULL
-        ORDER BY year DESC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    years = [r[0] for r in rows if r and r[0]]
-    if not years:
-        await message.answer("История матчей пуста.", reply_markup=judge_menu)
-        return
-    inline = InlineKeyboardMarkup(row_width=3)
-    buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
-    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
-    inline.add(*buttons)
-    await message.answer("Выберите год (судья):", reply_markup=inline)
-    await state.set_state(HistoryStates.choosing_year)
-
-@dp.callback_query(F.data.startswith("jhist_year:"))
-async def jhist_year_chosen(cb: types.CallbackQuery, state: FSMContext):
-    year = cb.data.split(":", 1)[1]
-    await state.update_data(j_year=year)
-
-    conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT DISTINCT strftime('%m', date) as month
-        FROM matches
-        WHERE result IS NOT NULL AND strftime('%Y', date)=?
-        ORDER BY month
-    """, (year,))
-    rows = cur.fetchall()
-    conn.close()
-    months = [r[0] for r in rows if r and r[0]]
-    if not months:
-        await cb.message.answer("Нет матчей в этом году.", reply_markup=judge_menu)
-        await cb.answer()
-        await state.clear()
-        return
-
-    inline = InlineKeyboardMarkup(row_width=4)
-    buttons = [InlineKeyboardButton(text=m, callback_data=f"jhist_month:{m}") for m in months]
-    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
-    inline.add(*buttons)
-    await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
-    await cb.answer()
-    await state.set_state(HistoryStates.choosing_month)
-
-@dp.callback_query(F.data.startswith("jhist_month:"))
-async def jhist_month_chosen(cb: types.CallbackQuery, state: FSMContext):
-    month = cb.data.split(":", 1)[1]
-    await state.update_data(j_month=month)
-    data = await state.get_data()
-    year = data.get("j_year")
-    conn, cur = conn_cursor()
-    cur.execute("""
-         SELECT DISTINCT strftime('%d', date) as day
-         FROM matches
-         WHERE result IS NOT NULL AND strftime('%Y', date)=? AND strftime('%m', date)=?
-         ORDER BY day
-    """, (year, month))
-    rows = cur.fetchall()
-    conn.close()
-    days = [r[0] for r in rows if r and r[0]]
-    if not days:
-        await cb.message.answer("Нет матчей в этом месяце.", reply_markup=judge_menu)
-        await cb.answer()
-        await state.clear()
-        return
-
-    inline = InlineKeyboardMarkup(row_width=6)
-    buttons = [InlineKeyboardButton(text=d, callback_data=f"jhist_day:{d}") for d in days]
-    buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:year"))
-    inline.add(*buttons)
-    await cb.message.answer(f"Выбран {year}-{month}. Выберите день:", reply_markup=inline)
-    await cb.answer()
-    await state.set_state(HistoryStates.choosing_day)
-
-@dp.callback_query(F.data.startswith("jhist_day:"))
-async def jhist_day_chosen(cb: types.CallbackQuery, state: FSMContext):
-    day = cb.data.split(":", 1)[1]
-    data = await state.get_data()
-    year = data.get("j_year")
-    month = data.get("j_month")
-    if not (year and month):
-        await cb.message.answer("Ошибка: год или месяц не выбраны.", reply_markup=judge_menu)
-        await cb.answer()
-        await state.clear()
-        return
-
-    y = str(year)
-    m = month.zfill(2)
-    d = day.zfill(2)
-    date_iso = f"{y}-{m}-{d}"
-
-    conn, cur = conn_cursor()
-    cur.execute("""
-        SELECT id, team1_id, team2_id, time, result, server, map
-        FROM matches
-        WHERE date=? AND result IS NOT NULL
-        ORDER BY time
-    """, (date_iso,))
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        await cb.message.answer(f"Нет сыгранных матчей за {date_iso}.", reply_markup=judge_menu)
-        await cb.answer()
-        await state.clear()
-        return
-
-    lines = []
-    conn, cur = conn_cursor()
-    for mid, t1, t2, tm, res, srv, mp in rows:
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t1,))
-        r1 = cur.fetchone()
-        name1 = r1[0] if r1 and r1[0] else f"ID {t1}"
-        cur.execute("SELECT team_name FROM users WHERE user_id=?", (t2,))
-        r2 = cur.fetchone()
-        name2 = r2[0] if r2 and r2[0] else (f"ID {t2}" if t2 else "??")
-        srv_text = f" | Сервер: {srv}" if srv else ""
-        map_text = f" | Карта: {mp}" if mp else ""
-        lines.append(f"ID {mid}: {tm} — {name1} vs {name2}{srv_text}{map_text} | {res}")
-    conn.close()
-
-    await cb.message.answer(f"📚 История матчей (все команды) за {date_iso}:\n" + "\n".join(lines), reply_markup=judge_menu)
-    await cb.answer()
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("jhist_back:"))
-async def jhist_back(cb: types.CallbackQuery, state: FSMContext):
-    payload = cb.data.split(":", 1)[1]
-    if payload == "menu":
-        await cb.message.answer("Возврат в меню судьи:", reply_markup=judge_menu)
-        await cb.answer()
-        await state.clear()
-        return
-    if payload == "year":
-        conn, cur = conn_cursor()
-        cur.execute("""
-            SELECT DISTINCT strftime('%Y', date) as year
-            FROM matches
-            WHERE result IS NOT NULL
-            ORDER BY year DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        years = [r[0] for r in rows if r and r[0]]
-        if not years:
-            await cb.message.answer("История пуста.", reply_markup=judge_menu)
-            await cb.answer()
-            await state.clear()
-            return
-        inline = InlineKeyboardMarkup(row_width=3)
-        buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
-        buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
-        inline.add(*buttons)
-        await cb.message.answer("Выберите год (судья):", reply_markup=inline)
-        await cb.answer()
-        await state.set_state(HistoryStates.choosing_year)
-        return
-    await cb.answer()
-
-# --------------- Админские хэндлеры ---------------
-@dp.message(Command("accept"))
-async def admin_accept(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Использование: /accept <user_id>")
-        return
-    try:
-        uid = int(parts[1])
-    except ValueError:
-        await message.answer("Неверный user_id. Пример: /accept 12345678")
-        return
-
-    conn, cur = conn_cursor()
-    cur.execute("SELECT role, team_name, phone FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        await message.answer("Пользователь не найден.")
-        return
-    role, team_name, phone = row
-    cur.execute("UPDATE users SET approved=1 WHERE user_id=?", (uid,))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-    # уведомления пользователю и администратору
-    try:
-        if role == "commander":
-            await send_safe(uid, f"✅ Ваша команда <b>{team_name}</b> одобрена администратором. Теперь вы можете пользоваться меню командира.")
-            await bot.send_message(uid, "Меню командира:", reply_markup=commander_menu)
-        else:
-            await send_safe(uid, "✅ Вы одобрены как судья администратором. Теперь вы можете пользоваться меню судьи.")
-            await bot.send_message(uid, "Меню судьи:", reply_markup=judge_menu)
-    except Exception:
-        logger.info("Не удалось уведомить пользователя %s об одобрении.", uid)
-
-    await message.answer(f"Пользователь {uid} одобрен.")
-
-@dp.message(Command("decline"))
-async def admin_decline(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Использование: /decline <user_id>")
-        return
-    try:
-        uid = int(parts[1])
-    except ValueError:
-        await message.answer("Неверный user_id. Пример: /decline 12345678")
-        return
-
-    conn, cur = conn_cursor()
-    cur.execute("SELECT role, team_name FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        await message.answer("Пользователь не найден.")
-        return
-    role, team_name = row
-    cur.execute("DELETE FROM users WHERE user_id=?", (uid,))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-    try:
-        await send_safe(uid, "❌ Ваша регистрация отклонена администратором.")
-    except Exception:
-        pass
-    await message.answer(f"Пользователь {uid} отклонён и удалён.")
-
+# ----------------- Misc admin commands -----------------
 @dp.message(Command("list_teams"))
 async def admin_list_teams(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if message.from_user.id not in ADMINS:
         return
     conn, cur = conn_cursor()
-    cur.execute("SELECT user_id, team_name, phone, COALESCE(approved,0) FROM users WHERE role='commander'")
+    cur.execute("SELECT user_id, team_name, phone, approved FROM users WHERE role='commander'")
     rows = cur.fetchall()
     conn.close()
     if not rows:
-        await message.answer("Нет зарегистрированных командиров.")
+        await message.answer("Команд нет.")
         return
-    lines = [f"ID {uid} | {team} | {phone} | {'✔' if a else '⏳'}" for uid, team, phone, a in rows]
+    lines = [f"UserID: {uid} | Team: {tn} | Phone: {ph} | Approved: {ap}" for uid, tn, ph, ap in rows]
     await message.answer("Список команд:\n" + "\n".join(lines))
 
 @dp.message(Command("list_judges"))
 async def admin_list_judges(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if message.from_user.id not in ADMINS:
         return
     conn, cur = conn_cursor()
-    cur.execute("SELECT user_id, phone, COALESCE(approved,0) FROM users WHERE role='judge'")
+    cur.execute("SELECT user_id, phone, approved FROM users WHERE role='judge'")
     rows = cur.fetchall()
     conn.close()
     if not rows:
-        await message.answer("Нет зарегистрированных судей.")
+        await message.answer("Судей нет.")
         return
-    lines = [f"ID {uid} | {phone} | {'✔' if a else '⏳'}" for uid, phone, a in rows]
+    lines = [f"UserID: {uid} | Phone: {ph} | Approved: {ap}" for uid, ph, ap in rows]
     await message.answer("Список судей:\n" + "\n".join(lines))
 
 @dp.message(Command("del_team"))
 async def admin_del_team(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if message.from_user.id not in ADMINS:
         return
     parts = message.text.split()
     if len(parts) < 2:
@@ -1719,34 +1034,17 @@ async def admin_del_team(message: types.Message):
     try:
         uid = int(parts[1])
     except ValueError:
-        await message.answer("Неверный user_id.")
+        await message.answer("Неверный user_id")
         return
     conn, cur = conn_cursor()
     cur.execute("DELETE FROM users WHERE user_id=? AND role='commander'", (uid,))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
     conn.commit()
     conn.close()
-    try:
-        await send_safe(uid, "❌ Ваша команда была удалена администратором.")
-    except Exception:
-        pass
-    await message.answer(f"Командир {uid} удалён.")
+    await message.answer(f"Команда пользователя {uid} удалена.")
 
 @dp.message(Command("del_judge"))
 async def admin_del_judge(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if message.from_user.id not in ADMINS:
         return
     parts = message.text.split()
     if len(parts) < 2:
@@ -1755,32 +1053,15 @@ async def admin_del_judge(message: types.Message):
     try:
         uid = int(parts[1])
     except ValueError:
-        await message.answer("Неверный user_id.")
+        await message.answer("Неверный user_id")
         return
     conn, cur = conn_cursor()
     cur.execute("DELETE FROM users WHERE user_id=? AND role='judge'", (uid,))
-    # таблица истории матчей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            team1_id INTEGER,
-            team2_id INTEGER,
-            date TEXT,
-            time TEXT,
-            result TEXT,
-            judge_id INTEGER
-        )
-    """)
-
     conn.commit()
     conn.close()
-    try:
-        await send_safe(uid, "❌ Вы были удалены из списка судей администратором.")
-    except Exception:
-        pass
     await message.answer(f"Судья {uid} удалён.")
 
-# --------------- Запуск ---------------
+# ----------------- Start polling -----------------
 async def main():
     logger.info("Удаляем webhook (если есть) и запускаем polling")
     try:
