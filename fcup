@@ -1511,3 +1511,133 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# --- AUTO-APPENDED PATCH ---
+
+
+# ----------------- AUTO-APPLIED PATCH -----------------
+# Дополнения: исключаем Server1, карта выбирается автоматически,
+# результаты судей переносятся в историю, при удалении матча удаляются заявки.
+# Эти функции добавлены в конец файла — они переопределяют/дополняют поведение бота.
+
+import random, sqlite3
+from datetime import datetime
+
+# Обновлённые константы (перезапись, если были определены ранее)
+MAPS = ["Narva", "Mutaha", "Harju", "Fallujah", "BlackCoast", "Sanxian"]
+SERVERS = ["Server2", "Server3", "Server4"]
+
+def pick_free_server(date_iso: str, time_val: str) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT server FROM matches WHERE date=? AND time=?", (date_iso, time_val))
+        busy = [r[0] for r in cur.fetchall() if r and r[0]]
+        available = [s for s in SERVERS if s not in busy]
+        return random.choice(available) if available else None
+    finally:
+        conn.close()
+
+def make_map_choice() -> str:
+    return random.choice(MAPS)
+
+# Патч: обработчик сохранения результата судьёй.
+# Попробуем зарегистрировать handler, но если aiogram API отличается — искать существующий обработчик.
+try:
+    from aiogram import F as _F, types as _types
+    @dp.message(_F.text, _F.state=JudgeStates.entering_result)
+    async def _patched_judge_save_result(message: _types.Message, state: FSMContext):
+        data = await state.get_data()
+        mid = data.get("chosen_match_id")
+        if not mid:
+            await message.answer("Ошибка: матч не выбран.")
+            await state.clear()
+            return
+        result_text = message.text.strip()
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT team1_id, team2_id, date, time, server, map FROM matches WHERE id=?", (mid,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            await message.answer("Матч не найден или уже обработан.")
+            await state.clear()
+            return
+        t1, t2, d, tm, srv, mp = row
+
+        # Вставляем в match_history (или history) и удаляем из matches
+        try:
+            cur.execute("INSERT INTO match_history (team1_id, team2_id, date, time, server, map, judge_id, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (t1, t2, d, tm, srv, mp, message.from_user.id, result_text))
+        except sqlite3.OperationalError:
+            try:
+                cur.execute("INSERT INTO history (team1_id, team2_id, date, time, server, map, judge_id, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (t1, t2, d, tm, srv, mp, message.from_user.id, result_text))
+            except sqlite3.OperationalError:
+                cur.execute(\"\"\"CREATE TABLE IF NOT EXISTS match_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team1_id INTEGER, team2_id INTEGER, date TEXT, time TEXT,
+                    server TEXT, map TEXT, judge_id INTEGER, result TEXT
+                )\"\"\")
+                cur.execute("INSERT INTO match_history (team1_id, team2_id, date, time, server, map, judge_id, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (t1, t2, d, tm, srv, mp, message.from_user.id, result_text))
+
+        cur.execute("DELETE FROM matches WHERE id=?", (mid,))
+        conn.commit()
+        conn.close()
+
+        # Уведомления
+        try:
+            await send_safe(t1, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
+            if t2:
+                await send_safe(t2, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
+            if GROUP_CHAT_ID:
+                await bot.send_message(GROUP_CHAT_ID, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
+        except Exception:
+            pass
+
+        await message.answer(f"✅ Результат для матча ID {mid} сохранён и матч перенесён в историю.")
+        await state.clear()
+except Exception:
+    # пропускаем, если несовместимо
+    pass
+
+# Патч: удаление матча судьёй — также удалить заявки команд на этот слот
+try:
+    @dp.callback_query(F.data.startswith("del_match:"))
+    async def _patched_judge_confirm_delete(cb: types.CallbackQuery, state: FSMContext = None):
+        mid = int(cb.data.split(":",1)[1])
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT team1_id, team2_id, date, time FROM matches WHERE id=?", (mid,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            await cb.message.answer("Матч не найден.")
+            await cb.answer()
+            return
+        t1, t2, d, tm = row
+        cur.execute("DELETE FROM matches WHERE id=?", (mid,))
+        try:
+            cur.execute("DELETE FROM match_requests WHERE team_id IN (?, ?) AND date=? AND time=?", (t1, t2, d, tm))
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
+
+        await cb.message.answer(f"Матч ID {mid} удалён ✅")
+        await send_safe(t1, f"❌ Матч ID {mid} ({d} {tm}) был удалён судьёй.")
+        if t2:
+            await send_safe(t2, f"❌ Матч ID {mid} ({d} {tm}) был удалён судьёй.")
+        if GROUP_CHAT_ID:
+            try:
+                await bot.send_message(GROUP_CHAT_ID, f"❌ Матч ID {mid} ({d} {tm}) был удалён судьёй.")
+            except Exception:
+                pass
+        await cb.answer()
+except Exception:
+    pass
+
+# ----------------- END PATCH -----------------
+
