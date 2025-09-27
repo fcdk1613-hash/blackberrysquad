@@ -112,6 +112,19 @@ def init_db():
         )
     """)
 
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -126,14 +139,40 @@ def ensure_columns():
     if "server" not in cols:
         try:
             cur.execute("ALTER TABLE matches ADD COLUMN server TEXT")
-            conn.commit()
+            # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
             logger.info("Добавлена колонка server в matches")
         except Exception as e:
             logger.warning("Не удалось добавить колонку server: %s", e)
     if "map" not in cols:
         try:
             cur.execute("ALTER TABLE matches ADD COLUMN map TEXT")
-            conn.commit()
+            # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
             logger.info("Добавлена колонка map в matches")
         except Exception as e:
             logger.warning("Не удалось добавить колонку map: %s", e)
@@ -150,7 +189,20 @@ def ensure_users_approved_column():
     if "approved" not in cols:
         try:
             cur.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 0")
-            conn.commit()
+            # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
             logger.info("Добавлена колонка approved в users")
         except Exception as e:
             logger.warning("Не удалось добавить колонку approved: %s", e)
@@ -175,6 +227,19 @@ def ensure_pending_confirmations_table():
             choice_team2 TEXT
         )
     """)
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -263,6 +328,19 @@ def has_match(team_id: int, date_iso: str, time_val: str) -> bool:
 def remove_request(team_id: int, date_iso: str, time_val: str):
     conn, cur = conn_cursor()
     cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (team_id, date_iso, time_val))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -360,6 +438,19 @@ async def got_contact(message: types.Message, state: FSMContext):
         INSERT OR REPLACE INTO users (user_id, phone, role, team_name, approved)
         VALUES (?, ?, ?, COALESCE((SELECT team_name FROM users WHERE user_id=?), NULL), 0)
     """, (user_id, phone, role, user_id))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -388,6 +479,19 @@ async def got_team_name(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     conn, cur = conn_cursor()
     cur.execute("UPDATE users SET team_name=?, approved=0 WHERE user_id=?", (team_name, user_id))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     # получим телефон для уведомления админов
     cur.execute("SELECT phone FROM users WHERE user_id=?", (user_id,))
@@ -491,6 +595,19 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
 
     # добавляем заявку текущей команды
     cur.execute("INSERT INTO match_requests (team_id, date, time) VALUES (?, ?, ?)", (user_id, date_iso, time_val))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
 
     # получаем все заявки других команд на ту же дату
@@ -543,12 +660,38 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
                 (candidate_id, user_id, date_iso, chosen_time, free_server)
             )
             pending_id = cur.lastrowid
-            conn.commit()
+            # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
 
             # удаляем соответствующие заявки на этот слот (если есть)
             cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (candidate_id, date_iso, chosen_time))
             cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (user_id, date_iso, chosen_time))
-            conn.commit()
+            # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
 
             # формируем клавиатуру выбора карт
             def make_map_kb(pending_id):
@@ -598,7 +741,20 @@ async def on_time_chosen(cb: types.CallbackQuery, state: FSMContext):
             cur.execute("INSERT INTO pending_confirmations (team1_id, team2_id, date, times_csv, choice_team1, choice_team2) VALUES (?, ?, ?, ?, NULL, NULL)",
                         (candidate_id, user_id, date_iso, times_csv))
             pc_id = cur.lastrowid
-            conn.commit()
+            # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
 
             # кнопки для выбора времени
             buttons = [[InlineKeyboardButton(text=t, callback_data=f"confirm_time:{pc_id}:{t}")] for t in common]
@@ -671,11 +827,37 @@ async def on_map_pick(cb: types.CallbackQuery):
     # сохраняем выбор
     if user_id == team1_id:
         cur.execute("UPDATE pending_matches SET map_choice_team1=? WHERE id=?", (map_choice, pending_id))
-        conn.commit()
+        # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
         await cb.answer(f"Вы выбрали карту: {map_choice}")
     else:
         cur.execute("UPDATE pending_matches SET map_choice_team2=? WHERE id=?", (map_choice, pending_id))
-        conn.commit()
+        # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
         await cb.answer(f"Вы выбрали карту: {map_choice}")
 
     # проверяем, выбрала ли вторая команда
@@ -702,7 +884,20 @@ async def on_map_pick(cb: types.CallbackQuery):
             cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (team2_id, date_iso, time_val))
         except Exception:
             logger.exception("Ошибка при удалении заявок при финализации матча.")
-        conn.commit()
+        # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
+    conn.commit()
 
         # уведомляем команды
         cur.execute("SELECT team_name FROM users WHERE user_id=?", (team1_id,))
@@ -1082,7 +1277,27 @@ async def judge_save_result(message: types.Message, state: FSMContext):
         return
     result_text = message.text.strip()
     conn, cur = conn_cursor()
-    cur.execute("UPDATE matches SET result=?, judge_id=? WHERE id=?", (result_text, message.from_user.id, mid))
+    # переносим матч в историю и удаляем из matches
+    cur.execute("SELECT team1_id, team2_id, date, time FROM matches WHERE id=?", (mid,))
+    match_row = cur.fetchone()
+    if match_row:
+        t1, t2, d, tm = match_row
+        cur.execute("INSERT INTO match_history (team1_id, team2_id, date, time, result, judge_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (t1, t2, d, tm, result_text, message.from_user.id))
+        cur.execute("DELETE FROM matches WHERE id=?", (mid,))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
 
     # уведомить команды
@@ -1158,6 +1373,19 @@ async def judge_confirm_delete(cb: types.CallbackQuery, state: FSMContext):
         cur.execute("DELETE FROM match_requests WHERE team_id=? AND date=? AND time=?", (t2, d, tm))
     except Exception as e:
         logger.info("Ошибка при удалении заявок: %s", e)
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -1379,6 +1607,19 @@ async def admin_accept(message: types.Message):
         return
     role, team_name, phone = row
     cur.execute("UPDATE users SET approved=1 WHERE user_id=?", (uid,))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -1418,6 +1659,19 @@ async def admin_decline(message: types.Message):
         return
     role, team_name = row
     cur.execute("DELETE FROM users WHERE user_id=?", (uid,))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
     try:
@@ -1469,6 +1723,19 @@ async def admin_del_team(message: types.Message):
         return
     conn, cur = conn_cursor()
     cur.execute("DELETE FROM users WHERE user_id=? AND role='commander'", (uid,))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
     try:
@@ -1492,6 +1759,19 @@ async def admin_del_judge(message: types.Message):
         return
     conn, cur = conn_cursor()
     cur.execute("DELETE FROM users WHERE user_id=? AND role='judge'", (uid,))
+    # таблица истории матчей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            result TEXT,
+            judge_id INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
     try:
