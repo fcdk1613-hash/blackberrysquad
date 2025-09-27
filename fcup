@@ -33,7 +33,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 # ----------------- Настройки -----------------
-API_TOKEN = "PUT_YOUR_TOKEN_HERE"  # <--- вставьте токен сюда
+API_TOKEN = "8392821328:AAHHINFxwpSZKGRcv0vQXogGc-pnXcAZspI"  # <--- вставьте токен сюда
 GROUP_CHAT_ID: Optional[int] = None  # при желании: -1001234567890
 DB_PATH = "tournament.db"
 
@@ -42,7 +42,7 @@ MAPS = ["Narva", "Mutaha", "Harju", "Fallujah", "BlackCoast", "Sanxian"]
 SERVERS = ["Server2", "Server3", "Server4"]
 
 # Список админов (вставьте Telegram user_id админов)
-ADMINS = [123456789]  # <-- изменить
+ADMINS = [403704696, 1806167653]  # <-- изменить
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
