@@ -812,7 +812,7 @@ async def history_start(message: types.Message, state: FSMContext):
     for y in years:
         buttons.append(InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}"))
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
-    inline.add(*buttons)
+    inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
 
     await message.answer("Выберите год:", reply_markup=inline)
     await state.set_state(HistoryStates.choosing_year)
@@ -844,7 +844,7 @@ async def history_year_chosen(cb: types.CallbackQuery, state: FSMContext):
     inline = InlineKeyboardMarkup(inline_keyboard=[])
     buttons = [InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}") for m in months]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:year"))
-    inline.add(*buttons)
+    inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
 
     await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
     await cb.answer()
@@ -880,7 +880,7 @@ async def history_month_chosen(cb: types.CallbackQuery, state: FSMContext):
     inline = InlineKeyboardMarkup(inline_keyboard=[])
     buttons = [InlineKeyboardButton(text=d, callback_data=f"hist_day:{d}") for d in days]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:month"))
-    inline.add(*buttons)
+    inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
 
     await cb.message.answer(f"Выбран {year}-{month}. Выберите день:", reply_markup=inline)
     await cb.answer()
@@ -963,7 +963,7 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         inline = InlineKeyboardMarkup(inline_keyboard=[])
         buttons = [InlineKeyboardButton(text=y, callback_data=f"hist_year:{y}") for y in years]
         buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:menu"))
-        inline.add(*buttons)
+        inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
         await cb.message.answer("Выберите год:", reply_markup=inline)
         await cb.answer()
         await state.set_state(HistoryStates.choosing_year)
@@ -995,7 +995,7 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         inline = InlineKeyboardMarkup(inline_keyboard=[])
         buttons = [InlineKeyboardButton(text=m, callback_data=f"hist_month:{m}") for m in months]
         buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="hist_back:year"))
-        inline.add(*buttons)
+        inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
         await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
         await cb.answer()
         await state.set_state(HistoryStates.choosing_month)
@@ -1207,7 +1207,7 @@ async def judge_history_start(message: types.Message, state: FSMContext):
     inline = InlineKeyboardMarkup(inline_keyboard=[])
     buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
-    inline.add(*buttons)
+    inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
     await message.answer("Выберите год (судья):", reply_markup=inline)
     await state.set_state(HistoryStates.choosing_year)
 
@@ -1235,7 +1235,7 @@ async def jhist_year_chosen(cb: types.CallbackQuery, state: FSMContext):
     inline = InlineKeyboardMarkup(inline_keyboard=[])
     buttons = [InlineKeyboardButton(text=m, callback_data=f"jhist_month:{m}") for m in months]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
-    inline.add(*buttons)
+    inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
     await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=inline)
     await cb.answer()
     await state.set_state(HistoryStates.choosing_month)
@@ -1265,7 +1265,7 @@ async def jhist_month_chosen(cb: types.CallbackQuery, state: FSMContext):
     inline = InlineKeyboardMarkup(inline_keyboard=[])
     buttons = [InlineKeyboardButton(text=d, callback_data=f"jhist_day:{d}") for d in days]
     buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:year"))
-    inline.add(*buttons)
+    inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
     await cb.message.answer(f"Выбран {year}-{month}. Выберите день:", reply_markup=inline)
     await cb.answer()
     await state.set_state(HistoryStates.choosing_day)
@@ -1348,7 +1348,7 @@ async def jhist_back(cb: types.CallbackQuery, state: FSMContext):
         inline = InlineKeyboardMarkup(inline_keyboard=[])
         buttons = [InlineKeyboardButton(text=y, callback_data=f"jhist_year:{y}") for y in years]
         buttons.append(InlineKeyboardButton(text="🔙 Назад", callback_data="jhist_back:menu"))
-        inline.add(*buttons)
+        inline = InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons])
         await cb.message.answer("Выберите год (судья):", reply_markup=inline)
         await cb.answer()
         await state.set_state(HistoryStates.choosing_year)
