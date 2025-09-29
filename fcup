@@ -133,7 +133,7 @@ cur.execute("""
     )
 """)
 
-    conn.close()
+      conn.close()
 
 def ensure_columns():
     """
