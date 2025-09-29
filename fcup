@@ -1,3 +1,8 @@
+# === Обновленная версия с изменениями ===
+# 1. Карты назначаются случайно
+# 2. Слоты блокируются, чтобы избежать дублей
+# 3. Матч можно назначить не позже чем за 2 часа
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -113,7 +118,22 @@ def init_db():
     """)
 
     conn.commit()
-    conn.close()
+# history матчей
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS match_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team1_id INTEGER,
+        team2_id INTEGER,
+        date TEXT,
+        time TEXT,
+        result TEXT,
+        judge_id INTEGER,
+        server TEXT,
+        map TEXT
+    )
+""")
+
+conn.close()
 
 def ensure_columns():
     """
@@ -1072,6 +1092,7 @@ async def judge_pick_match(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.set_state(JudgeStates.entering_result)
 
+
 @dp.message(JudgeStates.entering_result, F.text)
 async def judge_save_result(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -1082,30 +1103,40 @@ async def judge_save_result(message: types.Message, state: FSMContext):
         return
     result_text = message.text.strip()
     conn, cur = conn_cursor()
-    cur.execute("UPDATE matches SET result=?, judge_id=? WHERE id=?", (result_text, message.from_user.id, mid))
-    conn.commit()
-
-    # уведомить команды
-    cur.execute("SELECT team1_id, team2_id, date, time FROM matches WHERE id=?", (mid,))
+    # Получаем матч
+    cur.execute("SELECT team1_id, team2_id, date, time, server, map FROM matches WHERE id=?", (mid,))
     row = cur.fetchone()
-    if row:
-        team1_id, team2_id, d, tm = row
-        # отправляем ЛС, если возможно
-        await send_safe(team1_id, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
-        if team2_id:
-            await send_safe(team2_id, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
-        # group notify
-        if GROUP_CHAT_ID:
-            try:
-                await bot.send_message(GROUP_CHAT_ID, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm})")
-            except Exception as e:
-                logger.info("Не удалось отправить group notify: %s", e)
+    if not row:
+        await message.answer("Матч не найден.")
+        conn.close()
+        await state.clear()
+        return
+    team1_id, team2_id, d, tm, server, map_choice = row
 
+    # Вставляем в историю
+    cur.execute("""
+        INSERT INTO match_history (team1_id, team2_id, date, time, result, judge_id, server, map)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (team1_id, team2_id, d, tm, result_text, message.from_user.id, server, map_choice))
+
+    # Удаляем из текущих матчей
+    cur.execute("DELETE FROM matches WHERE id=?", (mid,))
+    conn.commit()
     conn.close()
-    await message.answer(f"✅ Результат для матча ID {mid} сохранён.")
+
+    # Уведомляем команды
+    await send_safe(team1_id, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm}) | Сервер: {server or '—'} | Карта: {map_choice or '—'}")
+    if team2_id:
+        await send_safe(team2_id, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm}) | Сервер: {server or '—'} | Карта: {map_choice or '—'}")
+    if GROUP_CHAT_ID:
+        try:
+            await bot.send_message(GROUP_CHAT_ID, f"🏁 Результат матча ID {mid}: {result_text} ({d} {tm}) | Сервер: {server or '—'} | Карта: {map_choice or '—'}")
+        except Exception as e:
+            logger.info("Не удалось отправить group notify: %s", e)
+
+    await message.answer(f"✅ Результат для матча ID {mid} сохранён и матч перенесён в историю.")
     await state.clear()
 
-# ---- Судья: удалить матч (inline selection) ----
 @dp.message(F.text == "🗑 Удалить матч")
 async def judge_delete_match_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
