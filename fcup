@@ -118,22 +118,9 @@ def init_db():
     """)
 
     conn.commit()
-# history матчей
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS match_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        team1_id INTEGER,
-        team2_id INTEGER,
-        date TEXT,
-        time TEXT,
-        result TEXT,
-        judge_id INTEGER,
-        server TEXT,
-        map TEXT
-    )
-""")
+    conn.close()
 
-conn.close()
+
 
 def ensure_columns():
     """
@@ -141,23 +128,27 @@ def ensure_columns():
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("PRAGMA table_info(matches)")
-    cols = [r[1] for r in cur.fetchall()]
-    if "server" not in cols:
-        try:
-            cur.execute("ALTER TABLE matches ADD COLUMN server TEXT")
-            conn.commit()
-            logger.info("Добавлена колонка server в matches")
-        except Exception as e:
-            logger.warning("Не удалось добавить колонку server: %s", e)
-    if "map" not in cols:
-        try:
-            cur.execute("ALTER TABLE matches ADD COLUMN map TEXT")
-            conn.commit()
-            logger.info("Добавлена колонка map в matches")
-        except Exception as e:
-            logger.warning("Не удалось добавить колонку map: %s", e)
-    conn.close()
+    try:
+        cur.execute("PRAGMA table_info(matches)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "server" not in cols:
+            try:
+                cur.execute("ALTER TABLE matches ADD COLUMN server TEXT")
+                conn.commit()
+                logger.info("Добавлена колонка server в matches")
+            except Exception as e:
+                logger.warning("Не удалось добавить колонку server: %s", e)
+        if "map" not in cols:
+            try:
+                cur.execute("ALTER TABLE matches ADD COLUMN map TEXT")
+                conn.commit()
+                logger.info("Добавлена колонка map в matches")
+            except Exception as e:
+                logger.warning("Не удалось добавить колонку map: %s", e)
+    except Exception as e:
+        logger.warning("ensure_columns: ошибка при проверке колонок matches: %s", e)
+    finally:
+        conn.close()
 
 def ensure_users_approved_column():
     """
