@@ -64,12 +64,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------- Инициализация бд -------------
-
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # таблица пользователей (командиры и судьи)
+    # таблица пользователей (командиры и судьи) — может не иметь approved (миграция ниже добавит)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -79,7 +78,7 @@ def init_db():
         )
     """)
 
-    # заявки команд
+    # заявки команд (ожидают соперника)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS match_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +88,7 @@ def init_db():
         )
     """)
 
-    # текущие матчи
+    # назначенные матчи (с полем server и map если есть)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,55 +103,75 @@ def init_db():
         )
     """)
 
-    # история матчей
+    # временные pending матчи до согласования карты
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS match_history (
+        CREATE TABLE IF NOT EXISTS pending_matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             team1_id INTEGER,
             team2_id INTEGER,
             date TEXT,
             time TEXT,
-            result TEXT,
-            judge_id INTEGER,
             server TEXT,
-            map TEXT
+            map_choice_team1 TEXT,
+            map_choice_team2 TEXT
         )
     """)
 
     conn.commit()
     conn.close()
 
-ensure_columns()
-ensure_users_approved_column()
 
-# --- Таблица подтверждений времени между двумя командами (если у них несколько общих слотов) ---
 
 def ensure_columns():
-    """Ensure important optional columns and tables exist (adds silently if absent)."""
+    """
+    Проверки/дополнение колонок на случай апгрейда БД (server, map).
+    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     try:
-        # ensure matches has server and map
         cur.execute("PRAGMA table_info(matches)")
         cols = [r[1] for r in cur.fetchall()]
         if "server" not in cols:
             try:
                 cur.execute("ALTER TABLE matches ADD COLUMN server TEXT")
-            except Exception:
-                pass
+                conn.commit()
+                logger.info("Добавлена колонка server в matches")
+            except Exception as e:
+                logger.warning("Не удалось добавить колонку server: %s", e)
         if "map" not in cols:
             try:
                 cur.execute("ALTER TABLE matches ADD COLUMN map TEXT")
-            except Exception:
-                pass
-        # ensure match_history table exists
-        cur.execute("CREATE TABLE IF NOT EXISTS match_history (id INTEGER PRIMARY KEY AUTOINCREMENT, team1_id INTEGER, team2_id INTEGER, date TEXT, time TEXT, result TEXT, judge_id INTEGER, server TEXT, map TEXT)")
-        conn.commit()
-    except Exception:
-        pass
+                conn.commit()
+                logger.info("Добавлена колонка map в matches")
+            except Exception as e:
+                logger.warning("Не удалось добавить колонку map: %s", e)
+    except Exception as e:
+        logger.warning("ensure_columns: ошибка при проверке колонок matches: %s", e)
     finally:
         conn.close()
 
+def ensure_users_approved_column():
+    """
+    Если в users нет колонки approved, добавим её. По-умолчанию 0 (ожидает одобрения).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(users)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "approved" not in cols:
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 0")
+            conn.commit()
+            logger.info("Добавлена колонка approved в users")
+        except Exception as e:
+            logger.warning("Не удалось добавить колонку approved: %s", e)
+    conn.close()
+
+init_db()
+ensure_columns()
+ensure_users_approved_column()
+
+# --- Таблица подтверждений времени между двумя командами (если у них несколько общих слотов) ---
 def ensure_pending_confirmations_table():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
