@@ -122,12 +122,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- Инициализация БД и проверка таблиц ---
-init_db()
-ensure_columns()
-ensure_users_approved_column()
-ensure_pending_confirmations_table()
-
 
 
 # --- Таблица подтверждений времени между двумя командами (если у них несколько общих слотов) ---
