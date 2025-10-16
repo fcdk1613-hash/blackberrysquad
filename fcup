@@ -1535,5 +1535,11 @@ async def main():
         logger.info("Ошибка при удалении webhook: %s", e)
     await dp.start_polling(bot)
 
+    # --- Инициализация БД и проверка таблиц ---
+init_db()
+ensure_columns()
+ensure_users_approved_column()
+ensure_pending_confirmations_table()
+
 if __name__ == "__main__":
     asyncio.run(main())
