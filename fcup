@@ -469,7 +469,25 @@ async def got_team_name(message: types.Message, state: FSMContext):
     # уведомляем админов о заявке
     for aid in ADMIN_IDS:
         try:
-            await send_safe(aid, f"🚨 Запрос на регистрацию команды
+            await send_safe(
+        aid,
+        (
+            f"🚨 Запрос на регистрацию команды
+"
+            f"ID: {user_id}
+"
+            f"Команда: {team_name}
+"
+            f"Ник: {nick}
+"
+            f"Телефон: {phone}
+
+"
+            f"Для подтверждения используйте: /accept {user_id}
+"
+            f"Для отклонения: /decline {user_id}"
+        )
+    )
 ID: {user_id}
 Команда: {team_name}
 Ник: {nick}
