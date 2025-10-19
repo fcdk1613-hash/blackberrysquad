@@ -404,9 +404,11 @@ async def got_contact(message: types.Message, state: FSMContext):
     conn.close()
 
     if role == "commander":
-        # запросим название команды
-        await message.answer("Отлично — теперь введите название вашей команды (одно сообщение):", reply_markup=ReplyKeyboardRemove())
-        await state.set_state(RegStates.waiting_for_team_name)
+        await message.answer("Введите ваш игровой ник:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(RegStates.waiting_for_nickname)
+    elif role == "player":
+        await message.answer("Введите ваш игровой ник:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(RegStates.waiting_for_nickname)
     else:
         # судья зарегистрирован, но ждёт одобрения
         await message.answer("⏳ Ваша заявка как судьи отправлена на рассмотрение администратору.")
@@ -1678,3 +1680,57 @@ async def judge_all_rosters(message: types.Message):
             chunk += para + "\n"
         if chunk:
             await message.answer(chunk)
+
+@dp.message(RegStates.waiting_for_nickname, F.text)
+async def got_nickname(message: types.Message, state: FSMContext):
+    nickname = message.text.strip()
+    if not nickname:
+        await message.answer("Ник не может быть пустым. Введите ещё раз:")
+        return
+    data = await state.get_data()
+    role = data.get("chosen_role")
+    user_id = message.from_user.id
+    conn, cur = conn_cursor()
+    cur.execute("UPDATE users SET nickname=? WHERE user_id=?", (nickname, user_id))
+    conn.commit()
+    conn.close()
+    if role == "commander":
+        await message.answer("Теперь введите название вашей команды:")
+        await state.set_state(RegStates.waiting_for_team_name)
+    else:
+        # игрок
+        conn, cur = conn_cursor()
+        cur.execute("SELECT phone FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone(); phone = row[0] if row and row[0] else "—"
+        conn.close()
+        await message.answer("⏳ Заявка на регистрацию игрока отправлена администратору.")
+        for aid in ADMIN_IDS:
+            try:
+                await send_safe(aid, f"🚨 Запрос на регистрацию игрока\nID: {user_id}\nНик: {nickname}\nТелефон: {phone}")
+            except Exception:
+                pass
+        await state.clear()
+
+
+@dp.message(Command("delplayer"))
+async def judge_delete_player(message: types.Message):
+    user_id = message.from_user.id
+    if not is_judge(user_id):
+        await message.answer("Команда доступна только для судей.")
+        return
+    parts = message.text.strip().split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /delplayer <user_id>")
+        return
+    pid = int(parts[1])
+    conn, cur = conn_cursor()
+    cur.execute("SELECT role, nickname, player_team_id FROM users WHERE user_id=?", (pid,))
+    row = cur.fetchone()
+    if not row or row[0] != "player":
+        conn.close()
+        await message.answer("Игрок с таким ID не найден.")
+        return
+    cur.execute("DELETE FROM users WHERE user_id=? AND role='player'", (pid,))
+    conn.commit()
+    conn.close()
+    await message.answer(f"✅ Игрок ID {pid} удалён.")
