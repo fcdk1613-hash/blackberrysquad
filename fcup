@@ -171,6 +171,25 @@ def ensure_users_approved_column():
 
 
 
+
+def ensure_pending_matches_table():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team1_id INTEGER,
+            team2_id INTEGER,
+            date TEXT,
+            time TEXT,
+            server TEXT,
+            map_choice_team1 TEXT,
+            map_choice_team2 TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
 def ensure_pending_confirmations_table():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -413,22 +432,10 @@ async def got_contact(message: types.Message, state: FSMContext):
         # уведомляем админов
         for aid in ADMIN_IDS:
             try:
-                msg = ("🚨 Запрос на регистрацию команды
-"       f"ID: {user_id}
-"       f"Команда: {team_name}
-"       f"Ник: {nick}
-"       f"Телефон: {phone}
-
-"       f"Для подтверждения используйте: /accept {user_id}
-"       f"Для отклонения: /decline {user_id}")
-await send_safe(aid, msg)
-ID: {user_id}
-Команда: {team_name}
-Ник: {nick}
-Телефон: {phone}\n\nДля подтверждения используйте: /accept {user_id}\nДля отклонения: /decline {user_id}")
-        except Exception:
-            logger.info("Не удалось оповестить админа %s о регистрации команды %s", aid, team_name)
-    await state.clear()
+                await send_safe(aid, f"🚨 Запрос на регистрацию судьи\nID: {user_id}\nТелефон: {phone}")
+            except Exception:
+                logger.info("Не удалось оповестить админа %s о регистрации судьи %s", aid, user_id)
+        await state.clear()
 
 # ---- Назначение матча: дата -> время -> сохранение заявки/ожидание соперника и карт ----
 @dp.message(F.text == "📅 Назначить игру")
@@ -841,8 +848,8 @@ async def history_start(message: types.Message, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT DISTINCT strftime('%Y', date) as year
-        FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+        FROM match_history
+        WHERE (team1_id=? OR team2_id=?)
         ORDER BY year DESC
     """, (user_id, user_id))
     rows = cur.fetchall()
@@ -873,8 +880,8 @@ async def history_year_chosen(cb: types.CallbackQuery, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT DISTINCT strftime('%m', date) as month
-        FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
+        FROM match_history
+        WHERE (team1_id=? OR team2_id=?) AND strftime('%Y', date)=?
         ORDER BY month
     """, (user_id, user_id, year))
     rows = cur.fetchall()
@@ -908,8 +915,8 @@ async def history_month_chosen(cb: types.CallbackQuery, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT DISTINCT strftime('%d', date) as day
-        FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+        FROM match_history
+        WHERE (team1_id=? OR team2_id=?)
           AND strftime('%Y', date)=? AND strftime('%m', date)=?
         ORDER BY day
     """, (user_id, user_id, year, month))
@@ -948,7 +955,7 @@ async def history_day_chosen(cb: types.CallbackQuery, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT id, team1_id, team2_id, time, result, server, map
-        FROM matches
+        FROM match_history
         WHERE date=? AND (team1_id=? OR team2_id=?)
         ORDER BY time
     """, (date_iso, user_id, user_id))
@@ -994,8 +1001,8 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         conn, cur = conn_cursor()
         cur.execute("""
             SELECT DISTINCT strftime('%Y', date) as year
-            FROM matches
-            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+            FROM match_history
+        WHERE (team1_id=? OR team2_id=?)
             ORDER BY year DESC
         """, (user_id, user_id))
         rows = cur.fetchall()
@@ -1026,8 +1033,8 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         conn, cur = conn_cursor()
         cur.execute("""
             SELECT DISTINCT strftime('%m', date) as month
-            FROM matches
-            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
+            FROM match_history
+        WHERE (team1_id=? OR team2_id=?) AND strftime('%Y', date)=?
             ORDER BY month
         """, (user_id, user_id, year))
         rows = cur.fetchall()
@@ -1296,8 +1303,8 @@ async def judge_history_start(message: types.Message, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT DISTINCT strftime('%Y', date) as year
-        FROM matches
-        WHERE result IS NOT NULL
+        FROM match_history
+        WHERE 1=1
         ORDER BY year DESC
     """)
     rows = cur.fetchall()
@@ -1321,8 +1328,8 @@ async def jhist_year_chosen(cb: types.CallbackQuery, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT DISTINCT strftime('%m', date) as month
-        FROM matches
-        WHERE result IS NOT NULL AND strftime('%Y', date)=?
+        FROM match_history
+        WHERE 1=1 AND strftime('%Y', date)=?
         ORDER BY month
     """, (year,))
     rows = cur.fetchall()
@@ -1351,8 +1358,8 @@ async def jhist_month_chosen(cb: types.CallbackQuery, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
          SELECT DISTINCT strftime('%d', date) as day
-         FROM matches
-         WHERE result IS NOT NULL AND strftime('%Y', date)=? AND strftime('%m', date)=?
+         FROM match_history
+        WHERE 1=1 AND strftime('%Y', date)=? AND strftime('%m', date)=?
          ORDER BY day
     """, (year, month))
     rows = cur.fetchall()
@@ -1392,8 +1399,8 @@ async def jhist_day_chosen(cb: types.CallbackQuery, state: FSMContext):
     conn, cur = conn_cursor()
     cur.execute("""
         SELECT id, team1_id, team2_id, time, result, server, map
-        FROM matches
-        WHERE date=? AND result IS NOT NULL
+        FROM match_history
+        WHERE date=?
         ORDER BY time
     """, (date_iso,))
     rows = cur.fetchall()
@@ -1435,8 +1442,8 @@ async def jhist_back(cb: types.CallbackQuery, state: FSMContext):
         conn, cur = conn_cursor()
         cur.execute("""
             SELECT DISTINCT strftime('%Y', date) as year
-            FROM matches
-            WHERE result IS NOT NULL
+            FROM match_history
+        WHERE 1=1
             ORDER BY year DESC
         """)
         rows = cur.fetchall()
