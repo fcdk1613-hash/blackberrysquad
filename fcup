@@ -55,7 +55,7 @@ DB_PATH = "tournament.db"
 ADMIN_IDS: List[int] = [403704696, 1806167653]  # например [123456789, 987654321]
 
 # Список серверов
-SERVER_LIST = ["Server 2", "Server 3"]
+SERVER_LIST = ["Server 2", "Server 3", "Server 4"]
 
 # Список карт
 MAP_LIST = ["Narva", "Mutaha", "Harju", "Fallujah", "BlackCoast", "Sanxian"]
@@ -805,7 +805,7 @@ async def history_start(message: types.Message, state: FSMContext):
     cur.execute("""
         SELECT DISTINCT strftime('%Y', date) as year
         FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+        WHERE (team1_id=? OR team2_id=?) 
         ORDER BY year DESC
     """, (user_id, user_id))
     rows = cur.fetchall()
@@ -837,7 +837,7 @@ async def history_year_chosen(cb: types.CallbackQuery, state: FSMContext):
     cur.execute("""
         SELECT DISTINCT strftime('%m', date) as month
         FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
+        WHERE (team1_id=? OR team2_id=?)  AND strftime('%Y', date)=?
         ORDER BY month
     """, (user_id, user_id, year))
     rows = cur.fetchall()
@@ -872,7 +872,7 @@ async def history_month_chosen(cb: types.CallbackQuery, state: FSMContext):
     cur.execute("""
         SELECT DISTINCT strftime('%d', date) as day
         FROM matches
-        WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+        WHERE (team1_id=? OR team2_id=?) 
           AND strftime('%Y', date)=? AND strftime('%m', date)=?
         ORDER BY day
     """, (user_id, user_id, year, month))
@@ -958,7 +958,7 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         cur.execute("""
             SELECT DISTINCT strftime('%Y', date) as year
             FROM matches
-            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL
+            WHERE (team1_id=? OR team2_id=?) 
             ORDER BY year DESC
         """, (user_id, user_id))
         rows = cur.fetchall()
@@ -990,7 +990,7 @@ async def history_back(cb: types.CallbackQuery, state: FSMContext):
         cur.execute("""
             SELECT DISTINCT strftime('%m', date) as month
             FROM matches
-            WHERE (team1_id=? OR team2_id=?) AND result IS NOT NULL AND strftime('%Y', date)=?
+            WHERE (team1_id=? OR team2_id=?)  AND strftime('%Y', date)=?
             ORDER BY month
         """, (user_id, user_id, year))
         rows = cur.fetchall()
@@ -1311,7 +1311,7 @@ async def jhist_day_chosen(cb: types.CallbackQuery, state: FSMContext):
     cur.execute("""
         SELECT id, team1_id, team2_id, time, result, server, map
         FROM matches
-        WHERE date=? AND result IS NOT NULL
+        WHERE date=? 
         ORDER BY time
     """, (date_iso,))
     rows = cur.fetchall()
