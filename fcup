@@ -412,82 +412,15 @@ async def got_contact(message: types.Message, state: FSMContext):
         # уведомляем админов
         for aid in ADMIN_IDS:
             try:
-                await send_safe(aid, f"🚨 Запрос на регистрацию судьи\nID: {user_id}\nТелефон: {phone}")
-            except Exception:
-                logger.info("Не удалось оповестить админа %s о регистрации судьи %s", aid, user_id)
-        await state.clear()
+                msg = ("🚨 Запрос на регистрацию команды
+"       f"ID: {user_id}
+"       f"Команда: {team_name}
+"       f"Ник: {nick}
+"       f"Телефон: {phone}
 
-
-@dp.message(RegStates.waiting_for_nickname, F.text)
-async def got_nickname(message: types.Message, state: FSMContext):
-    nickname = message.text.strip()
-    if not nickname:
-        await message.answer("Ник не может быть пустым. Введите ещё раз:")
-        return
-    data = await state.get_data()
-    role = data.get("chosen_role")
-    user_id = message.from_user.id
-    conn, cur = conn_cursor()
-    cur.execute("UPDATE users SET nickname=? WHERE user_id=?", (nickname, user_id))
-    conn.commit(); conn.close()
-    if role == "commander":
-        await message.answer("Теперь введите название вашей команды:")
-        await state.set_state(RegStates.waiting_for_team_name)
-    else:
-        # player flow
-        conn, cur = conn_cursor()
-        cur.execute("SELECT phone FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone(); conn.close()
-        phone = row[0] if row and row[0] else "—"
-        await message.answer("⏳ Заявка на регистрацию игрока отправлена администратору.")
-        for aid in ADMIN_IDS:
-            try:
-                await send_safe(aid, f"🚨 Запрос на регистрацию игрока\nID: {user_id}\nНик: {nickname}\nТелефон: {phone}")
-            except Exception:
-                pass
-        await state.clear()
-
-@dp.message(RegStates.waiting_for_team_name, F.text)
-async def got_team_name(message: types.Message, state: FSMContext):
-    team_name = message.text.strip()
-    if not team_name:
-        await message.answer("Название не может быть пустым. Введите ещё раз:")
-        return
-
-    user_id = message.from_user.id
-    conn, cur = conn_cursor()
-    cur.execute("UPDATE users SET team_name=?, approved=0 WHERE user_id=?", (team_name, user_id))
-    conn.commit()
-    # получим телефон для уведомления админов
-    cur.execute("SELECT phone, nickname FROM users WHERE user_id=?", (user_id,))
-    phone_row = cur.fetchone()
-    phone = phone_row[0] if phone_row and phone_row[0] else "—"
-    nick = phone_row[1] if phone_row and phone_row[1] else "—"
-    conn.close()
-
-    await message.answer(f"⏳ Заявка на регистрацию команды <b>{team_name}</b> отправлена администраторам для одобрения.")
-    # уведомляем админов о заявке
-    for aid in ADMIN_IDS:
-        try:
-            await send_safe(
-        aid,
-        (
-            f"🚨 Запрос на регистрацию команды
-"
-            f"ID: {user_id}
-"
-            f"Команда: {team_name}
-"
-            f"Ник: {nick}
-"
-            f"Телефон: {phone}
-
-"
-            f"Для подтверждения используйте: /accept {user_id}
-"
-            f"Для отклонения: /decline {user_id}"
-        )
-    )
+"       f"Для подтверждения используйте: /accept {user_id}
+"       f"Для отклонения: /decline {user_id}")
+await send_safe(aid, msg)
 ID: {user_id}
 Команда: {team_name}
 Ник: {nick}
